@@ -370,6 +370,62 @@ fn the_unlock_key_in_a_locked_pane_paints() {
     assert!(!app.pane.term_locked && app.chrome.dirty);
 }
 
+/// The bytes the locked pane's PTY gets for one key.
+fn typed_bytes(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Vec<u8> {
+    let mut out = Vec::new();
+    handle_terminal_event(app, key(code, mods), &mut out);
+    match out.as_slice() {
+        [ClientRequest::Input { data, .. }] => data.clone(),
+        other => panic!("expected one Input, got {other:?}"),
+    }
+}
+
+/// CYRILLIC SHORTCUTS: ⌘C on a Ukrainian layout arrives as `⌘с`; Claude
+/// Code (kitty keys) must still get the ⌘c it copies on.
+#[test]
+fn cmd_c_on_a_ukrainian_layout_reaches_a_kitty_session_as_cmd_c() {
+    let mut app = locked_pane_app();
+    app.pane.term.as_mut().unwrap().kitty_flags = 1;
+    let latin = typed_bytes(&mut app, KeyCode::Char('c'), KeyModifiers::SUPER);
+    let cyrillic = typed_bytes(&mut app, KeyCode::Char('с'), KeyModifiers::SUPER);
+    assert_eq!(latin, b"\x1b[99;9u");
+    assert_eq!(cyrillic, latin);
+}
+
+/// …and ^C on that layout still interrupts a shell.
+#[test]
+fn ctrl_c_on_a_ukrainian_layout_interrupts_a_legacy_session() {
+    let mut app = locked_pane_app();
+    assert_eq!(
+        typed_bytes(&mut app, KeyCode::Char('с'), KeyModifiers::CONTROL),
+        b"\x03"
+    );
+}
+
+/// Ukrainian text typed into a session stays Ukrainian.
+#[test]
+fn plain_cyrillic_typing_reaches_the_session_unchanged() {
+    let mut app = locked_pane_app();
+    assert_eq!(
+        typed_bytes(&mut app, KeyCode::Char('с'), KeyModifiers::NONE),
+        "с".as_bytes()
+    );
+}
+
+/// nebula's own Ctrl hotkeys answer on that layout too: ^Q is `^й`.
+#[test]
+fn the_unlock_key_works_on_a_ukrainian_layout() {
+    let mut app = locked_pane_app();
+    let mut out = Vec::new();
+    handle_terminal_event(
+        &mut app,
+        key(KeyCode::Char('й'), KeyModifiers::CONTROL),
+        &mut out,
+    );
+    assert!(out.is_empty(), "nothing went to the PTY: {out:?}");
+    assert!(!app.pane.term_locked, "the pane let go of the keys");
+}
+
 /// A turn that stops to ask in the pane the user is locked into typing
 /// at, terminal window focused, is already in front of them: nothing
 /// is queued. Previewing that pane from a panel (unlocked) still
