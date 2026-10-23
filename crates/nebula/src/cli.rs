@@ -253,6 +253,47 @@ pub(crate) enum Command {
         #[arg(long)]
         no_wait: bool,
     },
+    /// Delete worktrees and their sessions, as `d` does in the TUI.
+    ///
+    /// Each worktree is an id, a branch or a checkout path. nebula stops
+    /// every session and terminal in it, removes the checkout with `git
+    /// worktree remove`, and drops its row from the grid; the branch stays.
+    /// Run it instead of `git worktree remove`, which leaves the row and its
+    /// sessions behind. It first runs the delete check the TUI's confirm
+    /// shows, and deletes nothing when a checkout has uncommitted or
+    /// untracked files, processes working in it, or commits only a detached
+    /// HEAD holds; --force deletes anyway. A root checkout and the worktree
+    /// this session runs in are refused.
+    #[command(after_help = DELETE_WORKTREE_EXAMPLES)]
+    DeleteWorktree {
+        /// Worktree id, branch, or checkout path.
+        #[arg(
+            required_unless_present = "gone",
+            conflicts_with = "gone",
+            num_args = 1..,
+            value_name = "WORKTREE"
+        )]
+        worktrees: Vec<String>,
+        /// Delete every worktree whose checkout is already gone from disk —
+        /// removed with `git worktree remove` or `rm -rf` — with its sessions.
+        #[arg(long)]
+        gone: bool,
+        /// Delete even when the delete check finds work it would lose.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Archive sessions, as `a` does in the TUI.
+    ///
+    /// Each session is an id or a name (case-insensitive). Its process is
+    /// stopped and its card moves to the ARCHIVED group, where `u` in the TUI
+    /// brings it back. Every name must resolve before any session is
+    /// archived, and the session running this command is refused.
+    #[command(after_help = ARCHIVE_EXAMPLES)]
+    Archive {
+        /// Session id or name.
+        #[arg(required = true, num_args = 1.., value_name = "SESSION")]
+        sessions: Vec<String>,
+    },
     /// Coordinate projects from the orchestrator session.
     ///
     /// These commands are for the pinned orchestrator agent only. They are
@@ -539,6 +580,19 @@ Examples:
   nebula ask research \"which library did you recommend?\"
   nebula ask \"feature spike\" \"summarize your Redis findings\" --timeout 60
   nebula ask research \"are you idle?\" --no-wait";
+
+const DELETE_WORKTREE_EXAMPLES: &str = "\
+Examples:
+  nebula delete-worktree fix-auth          by branch
+  nebula delete-worktree ../app-wt/feat    by checkout path
+  nebula delete-worktree fix-auth --force  even with uncommitted files
+  nebula delete-worktree --gone            every row whose checkout is gone";
+
+const ARCHIVE_EXAMPLES: &str = "\
+Examples:
+  nebula archive agent-2
+  nebula archive agent-2 \"Fix Login Redirect\"
+  nebula archive 01HZY8QHA4AYM7M4XTA2G3KC9B";
 
 const ORCHESTRATOR_EXAMPLES: &str = "\
 Examples:

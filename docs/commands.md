@@ -22,6 +22,8 @@ nebula open <file>…         show files/images/diagrams in file tabs     (agent
 nebula sessions             list every session across every project     (agents run this)
 nebula read <session>       read recent context from another session    (agents run this)
 nebula ask <session> <q>    ask another session and print its answer    (agents run this)
+nebula delete-worktree <wt>… delete worktrees and their sessions, as d  (agents run this)
+nebula archive <session>…   archive sessions, as `a` does in the TUI    (agents run this)
 nebula config <cmd>         back up, restore or locate this machine's settings
 nebula browser              serve this TUI in a web browser via ttyd
 nebula ssh <host>           open nebula on a remote host over ssh
@@ -94,6 +96,24 @@ nebula ask <session> "<question>" [--timeout S] [--no-wait]
                           # send a labelled question into another local agent, wait for that turn
                           # to finish, and print the answer. A busy target is queued until idle by
                           # default; --no-wait fails fast instead.
+nebula delete-worktree <worktree>… [--force]
+                          # delete worktrees as `d` does in the TUI: each one's sessions and
+                          # terminals stop, its checkout is removed with `git worktree remove`
+                          # and its row leaves the grid; the branch stays. A worktree is an id,
+                          # a branch or a checkout path. Agents run this instead of `git
+                          # worktree remove`, which leaves the row and its sessions behind.
+                          # It first runs the delete check the TUI's confirm shows: uncommitted
+                          # or untracked files, processes working inside, or commits only a
+                          # detached HEAD holds delete nothing unless --force. A root checkout
+                          # and the caller's own worktree are refused.
+nebula delete-worktree --gone
+                          # delete every worktree whose checkout is already gone from disk, with
+                          # its sessions: the rows a `git worktree remove` or `rm -rf` left.
+nebula archive <session>…
+                          # archive sessions as `a` does in the TUI, by id or name
+                          # (case-insensitive): each process stops and its card moves to the
+                          # ARCHIVED group, where `u` brings it back. Every name resolves before
+                          # anything is archived; the session running it is refused.
 ```
 
 ## Settings

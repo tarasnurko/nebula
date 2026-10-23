@@ -130,6 +130,18 @@ pub fn run_ask_session(session: &str, question: String, timeout: u64, wait: bool
     runtime()?.block_on(ipc::ask_session(session, &question, timeout, wait))
 }
 
+/// `nebula delete-worktree <worktree>… [--force]` / `--gone` — delete
+/// worktrees and their sessions as `d` does (see `ipc::delete_worktrees`).
+pub fn run_delete_worktrees(targets: &[String], gone: bool, force: bool) -> Result<()> {
+    runtime()?.block_on(ipc::delete_worktrees(targets, gone, force))
+}
+
+/// `nebula archive <session>…` — archive sessions as `a` does (see
+/// `ipc::archive_sessions`).
+pub fn run_archive_sessions(targets: &[String]) -> Result<()> {
+    runtime()?.block_on(ipc::archive_sessions(targets))
+}
+
 pub fn run_orchestrator_list(json: bool) -> Result<()> {
     runtime()?.block_on(ipc::orchestrator_list(json))
 }

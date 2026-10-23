@@ -5180,6 +5180,199 @@ fn agent_cli(
         .unwrap()
 }
 
+/// Every session `nebula sessions --json` lists, as (id, alive).
+fn listed_sessions(env: &TestEnv, caller: &nebula_core::AgentId) -> Vec<(String, bool)> {
+    let out = agent_cli(env, caller, &["sessions", "--json"]);
+    assert!(out.status.success(), "nebula sessions failed: {out:?}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    json["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["id"].as_str().unwrap().to_string(),
+                s["alive"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn worktree_removed(events: &[ServerEvent], id: &nebula_core::WorktreeId) -> bool {
+    events.iter().any(|e| {
+        matches!(e, ServerEvent::EntityRemoved { id: EntityId::Worktree(w) } if w == id)
+    })
+}
+
+/// An agent's cleanup the old way, then with `nebula delete-worktree`:
+/// `git worktree remove` takes a finished task's checkout off the disk but
+/// leaves its row and its session on the grid, and `--gone` drops them. A
+/// named delete runs the delete check first, refuses a checkout holding
+/// untracked work with its session left running, and takes it on `--force`.
+#[tokio::test]
+async fn nebula_delete_worktree_cli_drops_what_git_left_and_guards_unsaved_work() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let caller = create_agent_get_id(&mut c, &main_worktree.id, "coordinator", 2).await;
+
+    // Two task checkouts cut behind nebula's back, as an agent cuts them,
+    // each adopted by the sync and given a session.
+    let checkout = |branch: &str| env.tmp.path().join("repo-worktrees").join(branch);
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let adopted = |evs: &[ServerEvent], branch: &str| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == branch => Some(w.clone()),
+            _ => None,
+        })
+    };
+    let mut rows = Vec::new();
+    for branch in ["done-task", "dirty-task"] {
+        let path = checkout(branch);
+        assert!(
+            git(&["worktree", "add", "-b", branch, path.to_str().unwrap()]),
+            "git worktree add {branch} failed"
+        );
+        let events =
+            read_events_until(&mut c, EVENT_TIMEOUT, |evs| adopted(evs, branch).is_some()).await;
+        rows.push(adopted(&events, branch).unwrap());
+    }
+    let (done_row, dirty_row) = (rows[0].clone(), rows[1].clone());
+    let done_agent = create_agent_get_id(&mut c, &done_row.id, "done", 3).await;
+    let dirty_agent = create_agent_get_id(&mut c, &dirty_row.id, "dirty", 4).await;
+
+    // The old cleanup: the checkout leaves the disk, the row and its
+    // session stay behind.
+    assert!(
+        git(&["worktree", "remove", "--force", checkout("done-task").to_str().unwrap()]),
+        "external git worktree remove failed"
+    );
+    let quiet = read_events_for(&mut c, Duration::from_millis(1500)).await;
+    assert!(
+        !worktree_removed(&quiet, &done_row.id),
+        "a row with a session in it outlives git's remove: {quiet:#?}"
+    );
+    assert!(listed_sessions(&env, &caller)
+        .iter()
+        .any(|(id, _)| *id == done_agent.0));
+
+    // `--gone` drops that row and its session, and nothing still on disk.
+    let out = agent_cli(&env, &caller, &["delete-worktree", "--gone"]);
+    assert!(out.status.success(), "delete-worktree --gone failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("deleted the worktree on done-task") && stdout.contains("its 1 session"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("dirty-task"), "stdout: {stdout}");
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| worktree_removed(evs, &done_row.id)).await;
+    let ids: Vec<String> = listed_sessions(&env, &caller)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(!ids.contains(&done_agent.0), "its session left with it: {ids:?}");
+    assert!(ids.contains(&dirty_agent.0) && ids.contains(&caller.0), "{ids:?}");
+
+    // Untracked work in a checkout: refused, and nothing was stopped.
+    std::fs::write(checkout("dirty-task").join("notes.txt"), "wip\n").unwrap();
+    let out = agent_cli(&env, &caller, &["delete-worktree", "dirty-task"]);
+    assert!(!out.status.success(), "a dirty checkout must be refused: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nothing deleted") && stderr.contains("1 uncommitted or untracked path"),
+        "stderr: {stderr}"
+    );
+    assert!(checkout("dirty-task").join("notes.txt").exists());
+    assert!(
+        listed_sessions(&env, &caller).contains(&(dirty_agent.0.clone(), true)),
+        "its session still runs"
+    );
+
+    // `--force` takes it, checkout and all, by its path this time.
+    let path = checkout("dirty-task");
+    let out = agent_cli(
+        &env,
+        &caller,
+        &["delete-worktree", path.to_str().unwrap(), "--force"],
+    );
+    assert!(out.status.success(), "delete-worktree --force failed: {out:?}");
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| worktree_removed(evs, &dirty_row.id)).await;
+    assert!(!path.exists(), "the checkout left the disk");
+    assert!(!listed_sessions(&env, &caller)
+        .iter()
+        .any(|(id, _)| *id == dirty_agent.0));
+
+    // The root checkout is never deleted.
+    let out = agent_cli(&env, &caller, &["delete-worktree", "main"]);
+    assert!(!out.status.success(), "the root must be refused: {out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("root checkout"));
+    assert!(repo.exists());
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// `nebula archive` by a name in any case; the session running it is
+/// refused, and one name that doesn't resolve archives none of the others.
+#[tokio::test]
+async fn nebula_archive_cli_archives_by_name_but_never_the_caller() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main_worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let caller = create_agent_get_id(&mut c, &main_worktree.id, "coordinator", 2).await;
+    let worker = create_agent_get_id(&mut c, &main_worktree.id, "Fix Login", 3).await;
+    let docs = create_agent_get_id(&mut c, &main_worktree.id, "Docs", 4).await;
+
+    let out = agent_cli(&env, &caller, &["archive", "fix login"]);
+    assert!(out.status.success(), "nebula archive failed: {out:?}");
+    read_events_until(&mut c, EVENT_TIMEOUT, |evs| {
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                    if a.id == worker && a.archived
+            )
+        })
+    })
+    .await;
+
+    let out = agent_cli(&env, &caller, &["archive", caller.0.as_str()]);
+    assert!(!out.status.success(), "archiving itself must be refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("running this command"));
+
+    let out = agent_cli(&env, &caller, &["archive", "docs", "no such session"]);
+    assert!(!out.status.success(), "a typo must fail the whole command");
+    let ids: Vec<String> = listed_sessions(&env, &caller)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(ids.contains(&docs.0) && ids.contains(&caller.0), "{ids:?}");
+    assert!(!ids.contains(&worker.0), "{ids:?}");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI
 /// resolves the path against its own cwd (the daemon's differs), registers
 /// the repo over IPC, and surfaces daemon rejections as nonzero exits.

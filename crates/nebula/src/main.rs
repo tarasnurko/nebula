@@ -64,6 +64,12 @@ fn main() -> Result<()> {
             timeout,
             no_wait,
         }) => nebula_tui::run_ask_session(&session, question.join(" "), timeout, !no_wait),
+        Some(Command::DeleteWorktree {
+            worktrees,
+            gone,
+            force,
+        }) => nebula_tui::run_delete_worktrees(&worktrees, gone, force),
+        Some(Command::Archive { sessions }) => nebula_tui::run_archive_sessions(&sessions),
         Some(Command::Orchestrator { command }) => match command {
             OrchestratorCommand::List { json } => nebula_tui::run_orchestrator_list(json),
             OrchestratorCommand::Read { session, bytes } => {

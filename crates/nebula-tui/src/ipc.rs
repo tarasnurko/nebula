@@ -6,8 +6,9 @@ use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
     env, paths, Agent, AgentId, AgentKind, ClientRequest, EnterOutcome, Link, Project, ProjectId,
     ReviewTabKind, ServerEvent, SessionRef, SessionSummary, TerminalId, TerminalTab, Worktree,
-    WorktreeId, PROTOCOL_VERSION,
+    WorktreeCheck, WorktreeId, CHECK_WORKTREE_PROTOCOL, PROTOCOL_VERSION,
 };
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
@@ -625,6 +626,401 @@ fn shell_word(value: &str) -> String {
     }
 }
 
+/// The tree `nebula delete-worktree` and `nebula archive` resolve their
+/// targets against: the daemon's Snapshot, taken by subscribing. The
+/// subscription keeps streaming changes into the connection afterwards;
+/// [`await_reply`] skips them.
+struct TreeSnapshot {
+    projects: Vec<Project>,
+    worktrees: Vec<Worktree>,
+    agents: Vec<Agent>,
+    terminals: Vec<TerminalTab>,
+}
+
+async fn fetch_snapshot(conn: &mut Connection) -> Result<TreeSnapshot> {
+    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Snapshot {
+                projects,
+                worktrees,
+                agents,
+                terminals,
+                ..
+            }) => {
+                return Ok(TreeSnapshot {
+                    projects,
+                    worktrees,
+                    agents,
+                    terminals,
+                })
+            }
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+/// The worktree the session running this CLI lives in, when it is a nebula
+/// session at all.
+fn caller_worktree<'a>(tree: &'a TreeSnapshot, caller: Option<&AgentId>) -> Option<&'a Worktree> {
+    let agent = tree.agents.iter().find(|a| Some(&a.id) == caller)?;
+    tree.worktrees.iter().find(|w| w.id == agent.worktree_id)
+}
+
+fn project_name<'a>(projects: &'a [Project], id: &'a ProjectId) -> &'a str {
+    projects
+        .iter()
+        .find(|p| &p.id == id)
+        .map_or(id.as_str(), |p| p.name.as_str())
+}
+
+/// `raw` as an absolute path from `cwd`: canonical when it still exists,
+/// else cleaned lexically, since a checkout deleted outside nebula has
+/// nothing left to canonicalize.
+fn absolute_path(cwd: &Path, raw: &str) -> PathBuf {
+    let path = cwd.join(raw);
+    std::fs::canonicalize(&path).unwrap_or_else(|_| path.components().collect())
+}
+
+/// Does a worktree row's stored path name `target` (from [`absolute_path`])?
+/// The row may be stored un-canonical (`/tmp` for `/private/tmp`), so a
+/// checkout still on disk is compared canonical too.
+fn names_path(row: &Path, target: &Path) -> bool {
+    row.components().collect::<PathBuf>() == target
+        || std::fs::canonicalize(row).is_ok_and(|real| real == target)
+}
+
+/// The worktree `raw` names for `nebula delete-worktree`: its id, its
+/// branch, or its checkout's path relative to `cwd`. A branch checked out
+/// in several projects resolves to the one in `home` — the project of the
+/// session running the command — and is ambiguous anywhere else.
+fn resolve_worktree<'a>(
+    tree: &'a TreeSnapshot,
+    raw: &str,
+    cwd: &Path,
+    home: Option<&ProjectId>,
+) -> Result<&'a Worktree> {
+    if let Some(w) = tree.worktrees.iter().find(|w| w.id.as_str() == raw) {
+        return Ok(w);
+    }
+    let mut matches: Vec<&Worktree> = tree.worktrees.iter().filter(|w| w.branch == raw).collect();
+    if matches.is_empty() {
+        let target = absolute_path(cwd, raw);
+        matches = tree
+            .worktrees
+            .iter()
+            .filter(|w| names_path(&w.path, &target))
+            .collect();
+    }
+    if matches.len() > 1 {
+        if let Some(home) = home {
+            let mine: Vec<&Worktree> = matches
+                .iter()
+                .copied()
+                .filter(|w| &w.project_id == home)
+                .collect();
+            if let [w] = mine.as_slice() {
+                return Ok(*w);
+            }
+        }
+    }
+    match matches.as_slice() {
+        [w] => Ok(*w),
+        [] => bail!(
+            "no worktree has the id, branch or path `{raw}` — `nebula sessions` lists each \
+             session's branch and worktree path"
+        ),
+        several => bail!(
+            "`{raw}` is checked out in {} projects ({}) — name the worktree's path instead",
+            several.len(),
+            several
+                .iter()
+                .map(|w| format!(
+                    "{} at {}",
+                    project_name(&tree.projects, &w.project_id),
+                    w.path.display()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The worktrees one `nebula delete-worktree` takes, each once, in the
+/// order named: the `--gone` sweep (every linked checkout no longer on
+/// disk) or the named ones. Refuses — before anything is deleted — a root
+/// checkout, and the worktree the calling session runs in, which the
+/// delete would stop mid-turn.
+fn pick_worktrees<'a>(
+    tree: &'a TreeSnapshot,
+    targets: &[String],
+    gone: bool,
+    cwd: &Path,
+    home: Option<&Worktree>,
+) -> Result<Vec<&'a Worktree>> {
+    let mut picked: Vec<&Worktree> = Vec::new();
+    if gone {
+        picked.extend(
+            tree.worktrees
+                .iter()
+                .filter(|w| !w.is_main && !w.path.exists())
+                .filter(|w| home.is_none_or(|h| h.id != w.id)),
+        );
+    }
+    for raw in targets {
+        let w = resolve_worktree(tree, raw, cwd, home.map(|h| &h.project_id))?;
+        if w.is_main {
+            bail!(
+                "`{raw}` is {}'s root checkout — nebula never deletes it; remove the project \
+                 instead",
+                project_name(&tree.projects, &w.project_id)
+            );
+        }
+        if home.is_some_and(|h| h.id == w.id) {
+            bail!(
+                "`{raw}` is the worktree this session runs in — deleting it would stop this \
+                 session mid-turn; run it from another session, or press d on it in the TUI"
+            );
+        }
+        if !picked.iter().any(|p| p.id == w.id) {
+            picked.push(w);
+        }
+    }
+    Ok(picked)
+}
+
+/// What stops `nebula delete-worktree` without `--force`: anything the
+/// DELETE CHECK found that the delete would interrupt or lose. Commits
+/// ahead of the base are not on the list while HEAD is on a branch — the
+/// branch keeps them after its checkout goes — only on a detached HEAD,
+/// where nothing does.
+fn delete_blockers(check: &WorktreeCheck) -> Vec<String> {
+    let plural = |n: u32| if n == 1 { "" } else { "s" };
+    let mut blockers = Vec::new();
+    if !check.processes.is_empty() {
+        let names = check
+            .processes
+            .iter()
+            .map(|p| format!("{} ({})", p.name, p.pid))
+            .collect::<Vec<_>>()
+            .join(", ");
+        blockers.push(format!("processes are working inside it: {names}"));
+    }
+    if let Some(err) = &check.process_error {
+        blockers.push(format!("could not look for processes inside it: {err}"));
+    }
+    if check.changes > 0 {
+        blockers.push(format!(
+            "{} uncommitted or untracked path{}",
+            check.changes,
+            plural(check.changes)
+        ));
+    }
+    if check.detached && check.ahead > 0 {
+        blockers.push(format!(
+            "{} commit{} on a detached HEAD that no branch holds",
+            check.ahead,
+            plural(check.ahead)
+        ));
+    }
+    if let Some(err) = &check.git_error {
+        blockers.push(format!("git could not be asked about it: {err}"));
+    }
+    blockers
+}
+
+async fn check_worktree(conn: &mut Connection, req_id: u64, id: &WorktreeId) -> Result<WorktreeCheck> {
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::CheckWorktree {
+            req_id,
+            id: id.clone(),
+        },
+    )
+    .await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::WorktreeChecked {
+                req_id: r, check, ..
+            }) if r == req_id => return Ok(check),
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
+            Some(_) => continue,
+            None => bail!("{CLOSED_BEFORE_REPLY}"),
+        }
+    }
+}
+
+/// CLI: `nebula delete-worktree <worktree>… [--force]` or `--gone` — take
+/// worktrees off the grid and off the disk the way `d` does in the TUI:
+/// the daemon stops every session and terminal in each one, removes the
+/// checkout with git (only drops git's record of one already deleted), and
+/// drops its rows. Every target resolves, and every DELETE CHECK passes,
+/// before anything is deleted. Never spawns a daemon: no daemon means no
+/// rows to drop.
+pub async fn delete_worktrees(targets: &[String], gone: bool, force: bool) -> Result<()> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running — nothing deleted");
+    };
+    let mut conn = handshake(stream).await?;
+    let tree = fetch_snapshot(&mut conn).await?;
+    let caller = env::non_empty(env::AGENT_ID).map(AgentId);
+    let home = caller_worktree(&tree, caller.as_ref());
+    let cwd = std::env::current_dir().context("read the current directory")?;
+    let picked = pick_worktrees(&tree, targets, gone, &cwd, home)?;
+    if picked.is_empty() {
+        println!("no worktree's checkout is gone from disk — nothing deleted");
+        return Ok(());
+    }
+    let mut req_id = ONE_SHOT_REQ_ID;
+    // A checkout already gone from disk has nothing left to lose or
+    // interrupt, so only the ones still there are checked.
+    let on_disk: Vec<&Worktree> = picked.iter().copied().filter(|w| w.path.exists()).collect();
+    if !force && !on_disk.is_empty() {
+        require_protocol(&conn, CHECK_WORKTREE_PROTOCOL, "delete-worktree")?;
+        let mut refusals = Vec::new();
+        for w in on_disk {
+            req_id += 1;
+            let blockers = delete_blockers(&check_worktree(&mut conn, req_id, &w.id).await?);
+            if !blockers.is_empty() {
+                refusals.push(format!(
+                    "  {} at {}: {}",
+                    w.branch,
+                    w.path.display(),
+                    blockers.join("; ")
+                ));
+            }
+        }
+        if !refusals.is_empty() {
+            bail!(
+                "nothing deleted — the delete would interrupt or lose work in:\n{}\n\
+                 `--force` deletes anyway",
+                refusals.join("\n")
+            );
+        }
+    }
+    for w in picked {
+        let sessions = tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == w.id && !a.archived)
+            .count()
+            + tree.terminals.iter().filter(|t| t.worktree_id == w.id).count();
+        req_id += 1;
+        // Force is the TUI's own call after its confirm: the check above is
+        // this command's confirm, and git's refusal of a dirty checkout
+        // would only land after its sessions were already stopped.
+        write_frame(
+            &mut conn.stream,
+            &ClientRequest::DeleteWorktree {
+                req_id,
+                id: w.id.clone(),
+                force: true,
+            },
+        )
+        .await?;
+        await_ack(&mut conn, req_id)
+            .await
+            .with_context(|| format!("delete the worktree on {}", w.branch))?;
+        let noun = if sessions == 1 { "session" } else { "sessions" };
+        println!(
+            "deleted the worktree on {} at {} — its {sessions} {noun} stopped and its row left \
+             the grid; the branch stays",
+            w.branch,
+            w.path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The session `raw` names for `nebula archive`: its id, or its name
+/// (case-insensitive), among sessions not already archived.
+fn resolve_session<'a>(agents: &'a [Agent], raw: &str) -> Result<&'a Agent> {
+    if let Some(a) = agents.iter().find(|a| a.id.as_str() == raw) {
+        if a.archived {
+            bail!("session `{raw}` is already archived");
+        }
+        return Ok(a);
+    }
+    let wanted = raw.trim().to_lowercase();
+    let named: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| !a.archived && a.name.to_lowercase() == wanted)
+        .collect();
+    match named.as_slice() {
+        [a] => Ok(*a),
+        [] => bail!("no session has the id or name `{raw}` — `nebula sessions` lists them"),
+        several => bail!(
+            "{} sessions are named `{raw}` ({}) — name one by its id",
+            several.len(),
+            several
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The sessions one `nebula archive` takes, each once: every name resolves
+/// first, and the calling session is refused, so a typo or a self-archive
+/// archives nothing.
+fn pick_sessions<'a>(
+    agents: &'a [Agent],
+    targets: &[String],
+    caller: Option<&AgentId>,
+) -> Result<Vec<&'a Agent>> {
+    let mut picked: Vec<&Agent> = Vec::new();
+    for raw in targets {
+        let a = resolve_session(agents, raw)?;
+        if Some(&a.id) == caller {
+            bail!(
+                "`{raw}` is the session running this command — archiving it would stop it \
+                 mid-turn"
+            );
+        }
+        if !picked.iter().any(|p| p.id == a.id) {
+            picked.push(a);
+        }
+    }
+    Ok(picked)
+}
+
+/// CLI: `nebula archive <session>…` — what `a` does in the TUI: the daemon
+/// stops each session's process and moves its card into the ARCHIVED
+/// group, where `u` brings it back. Never spawns a daemon.
+pub async fn archive_sessions(targets: &[String]) -> Result<()> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running — nothing archived");
+    };
+    let mut conn = handshake(stream).await?;
+    let tree = fetch_snapshot(&mut conn).await?;
+    let caller = env::non_empty(env::AGENT_ID).map(AgentId);
+    let picked = pick_sessions(&tree.agents, targets, caller.as_ref())?;
+    let mut req_id = ONE_SHOT_REQ_ID;
+    for a in picked {
+        req_id += 1;
+        write_frame(
+            &mut conn.stream,
+            &ClientRequest::ArchiveAgent {
+                req_id,
+                id: a.id.clone(),
+            },
+        )
+        .await?;
+        await_ack(&mut conn, req_id)
+            .await
+            .with_context(|| format!("archive {}", a.name))?;
+        println!("archived {} ({})", shell_word(&a.name), a.id);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct OrchestratorTree {
     projects: Vec<Project>,
@@ -1212,6 +1608,215 @@ fn send_signal(pid: i32, sig: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project(id: &str, name: &str) -> Project {
+        Project {
+            id: ProjectId(id.into()),
+            name: name.into(),
+            repo_path: format!("/repos/{name}").into(),
+            sort_order: 0,
+        }
+    }
+
+    fn worktree(id: &str, project: &str, branch: &str, path: &str, is_main: bool) -> Worktree {
+        Worktree {
+            id: WorktreeId(id.into()),
+            project_id: ProjectId(project.into()),
+            path: path.into(),
+            branch: branch.into(),
+            is_main,
+            sort_order: 0,
+        }
+    }
+
+    fn agent(id: &str, worktree: &str, name: &str, archived: bool) -> Agent {
+        Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId(worktree.into()),
+            name: name.into(),
+            status: nebula_core::AgentStatus::Finished,
+            archived,
+            archived_at: 0,
+            unseen: false,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: true,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+            recent_prompts: Vec::new(),
+        }
+    }
+
+    /// Two projects that both have a `feat` checkout, plus each one's root.
+    /// No path exists on disk, like checkouts removed outside nebula.
+    fn tree() -> TreeSnapshot {
+        TreeSnapshot {
+            projects: vec![project("p1", "api"), project("p2", "web")],
+            worktrees: vec![
+                worktree("w1", "p1", "main", "/repos/api", true),
+                worktree("w2", "p1", "feat", "/wt/api-feat", false),
+                worktree("w3", "p2", "main", "/repos/web", true),
+                worktree("w4", "p2", "feat", "/wt/web-feat", false),
+                worktree("w5", "p2", "fix/login", "/wt/web-login", false),
+            ],
+            agents: Vec::new(),
+            terminals: Vec::new(),
+        }
+    }
+
+    fn picked_ids(picked: &[&Worktree]) -> Vec<String> {
+        picked.iter().map(|w| w.id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_worktree_resolves_by_id_branch_or_path() {
+        let tree = tree();
+        let cwd = Path::new("/wt");
+        let resolve = |raw: &str| resolve_worktree(&tree, raw, cwd, None).map(|w| w.id.to_string());
+        assert_eq!(resolve("w2").unwrap(), "w2");
+        // A branch with a slash is still a branch, not a path under cwd.
+        assert_eq!(resolve("fix/login").unwrap(), "w5");
+        // Absolute, relative to cwd, and with a trailing slash.
+        assert_eq!(resolve("/wt/web-feat").unwrap(), "w4");
+        assert_eq!(resolve("api-feat").unwrap(), "w2");
+        assert_eq!(resolve("./web-login/").unwrap(), "w5");
+        let err = resolve("nope").unwrap_err().to_string();
+        assert!(err.contains("no worktree"), "{err}");
+    }
+
+    // `feat` is checked out in both projects: the caller's own project
+    // settles it, and with no caller (a plain shell) it stays ambiguous
+    // rather than deleting whichever row comes first.
+    #[test]
+    fn a_branch_in_several_projects_resolves_only_within_the_callers_project() {
+        let tree = tree();
+        let cwd = Path::new("/");
+        let in_web = resolve_worktree(&tree, "feat", cwd, Some(&ProjectId("p2".into()))).unwrap();
+        assert_eq!(in_web.id.as_str(), "w4");
+        let in_api = resolve_worktree(&tree, "feat", cwd, Some(&ProjectId("p1".into()))).unwrap();
+        assert_eq!(in_api.id.as_str(), "w2");
+        let err = resolve_worktree(&tree, "feat", cwd, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 projects"), "{err}");
+        assert!(err.contains("/wt/api-feat") && err.contains("/wt/web-feat"), "{err}");
+    }
+
+    #[test]
+    fn picking_refuses_a_root_and_the_callers_own_worktree_before_anything() {
+        let tree = tree();
+        let cwd = Path::new("/");
+        let home = &tree.worktrees[1]; // w2, api's feat
+        let err = pick_worktrees(&tree, &["w4".into(), "w1".into()], false, cwd, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("root checkout"), "{err}");
+        let err = pick_worktrees(&tree, &["w4".into(), "w2".into()], false, cwd, Some(home))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("this session runs in"), "{err}");
+        // Named twice, by branch and by id: taken once, in the order named.
+        let picked =
+            pick_worktrees(&tree, &["w5".into(), "fix/login".into(), "w4".into()], false, cwd, Some(home))
+                .unwrap();
+        assert_eq!(picked_ids(&picked), ["w5", "w4"]);
+    }
+
+    // The sweep takes linked checkouts that are gone from disk: never a
+    // root (also missing here), never one still on disk, and never the
+    // caller's own, whose delete would stop the caller.
+    #[test]
+    fn the_gone_sweep_takes_missing_linked_checkouts_but_not_the_callers() {
+        let mut tree = tree();
+        let on_disk = tempfile::tempdir().unwrap();
+        tree.worktrees.push(worktree(
+            "w6",
+            "p1",
+            "live",
+            on_disk.path().to_str().unwrap(),
+            false,
+        ));
+        let home = tree.worktrees[1].clone(); // w2
+        let cwd = Path::new("/");
+        let picked = pick_worktrees(&tree, &[], true, cwd, None).unwrap();
+        assert_eq!(picked_ids(&picked), ["w2", "w4", "w5"]);
+        let picked = pick_worktrees(&tree, &[], true, cwd, Some(&home)).unwrap();
+        assert_eq!(picked_ids(&picked), ["w4", "w5"]);
+    }
+
+    #[test]
+    fn only_work_the_delete_would_lose_or_interrupt_blocks_it() {
+        assert!(delete_blockers(&WorktreeCheck::default()).is_empty());
+        // Commits ahead on a branch survive the checkout: not a blocker.
+        let on_branch = WorktreeCheck {
+            ahead: 3,
+            base: Some("origin/main".into()),
+            ..WorktreeCheck::default()
+        };
+        assert!(delete_blockers(&on_branch).is_empty());
+        // On a detached HEAD nothing keeps them.
+        let detached = WorktreeCheck {
+            detached: true,
+            ..on_branch
+        };
+        let blockers = delete_blockers(&detached);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("3 commits on a detached HEAD"), "{blockers:?}");
+        let dirty = WorktreeCheck {
+            changes: 1,
+            processes: vec![nebula_core::WorktreeProcess {
+                pid: 42,
+                name: "cargo".into(),
+            }],
+            git_error: Some("not a git repository".into()),
+            ..WorktreeCheck::default()
+        };
+        let blockers = delete_blockers(&dirty).join("; ");
+        assert!(blockers.contains("cargo (42)"), "{blockers}");
+        assert!(blockers.contains("1 uncommitted or untracked path;"), "{blockers}");
+        assert!(blockers.contains("not a git repository"), "{blockers}");
+    }
+
+    #[test]
+    fn a_session_resolves_by_id_or_case_insensitive_name_among_unarchived() {
+        let agents = vec![
+            agent("a1", "w1", "Fix Login", false),
+            agent("a2", "w1", "Old Run", true),
+            agent("a3", "w2", "Twin", false),
+            agent("a4", "w4", "twin", false),
+        ];
+        let resolve = |raw: &str| resolve_session(&agents, raw).map(|a| a.id.to_string());
+        assert_eq!(resolve("a1").unwrap(), "a1");
+        assert_eq!(resolve("fix login").unwrap(), "a1");
+        let err = resolve("a2").unwrap_err().to_string();
+        assert!(err.contains("already archived"), "{err}");
+        let err = resolve("old run").unwrap_err().to_string();
+        assert!(err.contains("no session"), "an archived name is not a match: {err}");
+        let err = resolve("TWIN").unwrap_err().to_string();
+        assert!(err.contains("a3") && err.contains("a4"), "{err}");
+    }
+
+    #[test]
+    fn picking_sessions_refuses_the_caller_and_takes_each_once() {
+        let agents = vec![
+            agent("a1", "w1", "Fix Login", false),
+            agent("a3", "w2", "Docs", false),
+        ];
+        let caller = AgentId("a1".into());
+        let err = pick_sessions(&agents, &["docs".into(), "a1".into()], Some(&caller))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("running this command"), "{err}");
+        let picked = pick_sessions(&agents, &["docs".into(), "a3".into()], Some(&caller)).unwrap();
+        let ids: Vec<&str> = picked.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["a3"]);
+    }
 
     // Unset and empty are the same miss, and the error has to name the
     // command the model just ran so it knows why it can't work here.
