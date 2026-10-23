@@ -190,6 +190,10 @@ pub(crate) fn dispatch_terminal_event(app: &mut App, event: Event, out: &mut Vec
 
 /// [`dispatch_terminal_event`]'s body: the event to its handler.
 pub(crate) fn dispatch_input(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
+    let event = match event {
+        Event::Key(key) => Event::Key(crate::layout_keys::latin_shortcut(key)),
+        other => other,
+    };
     match event {
         // The RELEASE WATCH reads every key first: a held unarchive key's
         // repeats end here, one unarchive per press (release_watch.rs).
