@@ -226,11 +226,6 @@ fn draw_menu_overlay(f: &mut Frame, app: &mut App, menu: crate::app::ContextMenu
 }
 
 fn draw_confirm_overlay(f: &mut Frame, app: &mut App, confirm: crate::app::ConfirmDialog) {
-    // A worktree delete waits, unshown, for a moment for its DELETE CHECK
-    // so it opens once and filled in; the footer says it is checking.
-    if crate::delete_check::held(app) {
-        return;
-    }
     let th = app.chrome.theme;
     // Bulk deletes itemize their casualties across several message
     // lines — size the dialog to fit them.
@@ -921,6 +916,7 @@ fn append_settings_row(
             tab,
             inner,
             project_settings,
+            project.map(|(_, path)| path.as_path()),
             label_w,
             new_prefix,
             th,
@@ -938,6 +934,7 @@ fn append_setting_value_row(
     tab: usize,
     inner: Rect,
     project_settings: Option<&crate::config::ProjectSettings>,
+    project_path: Option<&std::path::Path>,
     label_w: usize,
     new_prefix: &impl Fn(crate::config::SettingKind) -> &'static str,
     th: Theme,
@@ -956,6 +953,16 @@ fn append_setting_value_row(
                 (field.label().to_string(), cfg.agent_value(&id, field), "")
             }
         }
+    } else if let Some(id) = (tab == crate::config::project_tab())
+        .then(|| cfg.project_account_row(i))
+        .flatten()
+    {
+        // An ACCOUNT row below the Project tab's typed rows: one per
+        // harness with an account switch, valued for the selected project.
+        let value = project_path
+            .map(|path| cfg.project_account_label(path, &id))
+            .unwrap_or_else(|| "n/a".into());
+        (cfg.project_account_row_label(&id), value, "")
     } else {
         let spec =
             crate::config::setting_at(tab, i).expect("settings_rows indexes this tab's settings");
@@ -1358,7 +1365,11 @@ fn draw_diff_overlay(f: &mut Frame, app: &mut App, view: crate::app::DiffView) {
         (diff_a.width as usize).saturating_sub(4),
     );
     let mut block = panel_block(&title, true, th).title_bottom(Line::from(Span::styled(
-        " ^r: toggle reviewed ",
+        if view.selected_file().is_some() && view.prefetched.is_none() {
+            " ^o: edit · ^r: toggle reviewed · ^s: split/inline "
+        } else {
+            " ^r: toggle reviewed · ^s: split/inline "
+        },
         Style::default().fg(th.dim),
     )));
     let diff_inner = block.inner(diff_a);
@@ -1783,7 +1794,7 @@ fn draw_diff_file_list(
             .as_ref()
             .map(|tree| tree.reviewed_nodes(&view.files, &view.reviewed));
         let start = crate::app::window_start(view.side_cursor(), list_inner.height as usize);
-        let now = crate::app::now_ms() as i64;
+        let now = crate::app::now_ms();
         for row in 0..list_inner.height as usize {
             let index = start + row;
             let Some((place, inner)) = view.side_row(index) else {

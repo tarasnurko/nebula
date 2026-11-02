@@ -35,14 +35,13 @@ pub struct ModelEntry {
     pub hint: Option<String>,
 }
 
-/// Which TUI-side catalogue supplies a harness's model (and, for Cursor,
-/// effort) rows at runtime, in place of the descriptor's static lists:
-/// Claude's `claude_models` / `availableModels` allowlist, or Cursor's
-/// `--list-models` union over its seed.
+/// Which TUI-side catalogue supplies a harness's model / effort rows at
+/// runtime, in place of the descriptor's static lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessCatalog {
     Claude,
+    Codex,
     Cursor,
 }
 
@@ -50,6 +49,7 @@ impl HarnessCatalog {
     pub fn as_str(self) -> &'static str {
         match self {
             HarnessCatalog::Claude => "claude",
+            HarnessCatalog::Codex => "codex",
             HarnessCatalog::Cursor => "cursor",
         }
     }
@@ -57,6 +57,7 @@ impl HarnessCatalog {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.trim() {
             "claude" => HarnessCatalog::Claude,
+            "codex" => HarnessCatalog::Codex,
             "cursor" => HarnessCatalog::Cursor,
             _ => return None,
         })
@@ -201,6 +202,100 @@ pub struct HarnessDescriptor {
     /// (Cursor's family-suffix shape).
     #[serde(default, skip_serializing_if = "is_false")]
     pub compose_model_effort: bool,
+    /// Where the CLI keeps its ACCOUNT (login, settings, chats) and which
+    /// account folder new sessions start on. Empty for a CLI with no
+    /// account switch: it gets no account rows.
+    #[serde(default, skip_serializing_if = "AccountSpec::is_empty")]
+    pub account: AccountSpec,
+}
+
+/// A harness's ACCOUNT switch: the env var that points its CLI at an
+/// account folder, the folder it uses with the var unset, and the folder
+/// new sessions start on when their project names none (Settings → Agents).
+/// A project's own pick (Settings → Project) wins over `dir`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSpec {
+    /// Env var naming the account folder (`CLAUDE_CONFIG_DIR`,
+    /// `CODEX_HOME`). None = the CLI has no such switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// The CLI's own folder with the var unset (`~/.claude`). The account
+    /// pickers list it and every sibling folder whose name starts with its
+    /// name (`~/.claude-work`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
+    /// The account folder new sessions start on when their project names
+    /// none. None = no folder is passed: the CLI (or the program wrapping
+    /// it) picks, as before accounts existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
+
+impl AccountSpec {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// An account folder as typed or stored — `~`, `~/x` or absolute — as a
+/// path: trimmed, `~` expanded to the home dir. Blank is None.
+pub fn expand_account_dir(dir: &str) -> Option<std::path::PathBuf> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return None;
+    }
+    if dir == "~" {
+        return crate::env::home_dir();
+    }
+    if let Some(rest) = dir.strip_prefix("~/") {
+        return crate::env::home_dir().map(|home| home.join(rest));
+    }
+    Some(std::path::PathBuf::from(dir))
+}
+
+/// The CLI's own account folder `home` (`~/.claude`) and every folder
+/// beside it whose name starts with its name (`~/.claude-work`), as shown,
+/// sorted — the account folders a picker finds without being told. Files
+/// (`~/.claude.json`) are not folders and are skipped.
+pub fn discover_account_folders(home: &str) -> Vec<String> {
+    let Some(path) = expand_account_dir(home) else {
+        return Vec::new();
+    };
+    let (Some(parent), Some(prefix)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return Vec::new();
+    };
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix))
+                && entry.path().is_dir()
+        })
+        .map(|entry| entry.path())
+        .collect();
+    found.sort();
+    found.iter().map(|p| shown_account_dir(p)).collect()
+}
+
+/// An account folder as the pickers show and the file keeps it: `~/x`
+/// under the home dir, so a synced config reads right on another machine;
+/// the absolute path elsewhere.
+pub fn shown_account_dir(path: &std::path::Path) -> String {
+    if let Some(home) = crate::env::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return if rest.as_os_str().is_empty() {
+                "~".into()
+            } else {
+                format!("~/{}", rest.display())
+            };
+        }
+    }
+    path.display().to_string()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -240,6 +335,37 @@ impl Default for EffortSpec {
 }
 
 impl HarnessDescriptor {
+    /// Whether this harness's sessions can be pointed at an account
+    /// folder — what gives it account rows in Settings.
+    pub fn has_accounts(&self) -> bool {
+        self.account_env().is_some()
+    }
+
+    /// The env var naming the account folder, when the harness has one.
+    pub fn account_env(&self) -> Option<&str> {
+        self.account
+            .env
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The account folder a new session starts on: its project's pick
+    /// (`project`), else the harness's own (`account.dir`). None = no
+    /// folder is passed, and always None for a harness with no account
+    /// switch.
+    pub fn account_for(&self, project: Option<&str>) -> Option<String> {
+        if !self.has_accounts() {
+            return None;
+        }
+        [project, self.account.dir.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|dir| !dir.is_empty())
+            .map(str::to_string)
+    }
+
     /// The label the picker and session rows show.
     pub fn display_label(&self) -> &str {
         if self.label.trim().is_empty() {
@@ -382,6 +508,7 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
         hooks: None,
         relocation_prompt: false,
         compose_model_effort: false,
+        account: AccountSpec::default(),
     };
     Some(match id.trim() {
         "claude" => HarnessDescriptor {
@@ -413,6 +540,11 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
             },
             hooks: Some("claude".into()),
             relocation_prompt: true,
+            account: AccountSpec {
+                env: Some("CLAUDE_CONFIG_DIR".into()),
+                home: Some("~/.claude".into()),
+                dir: None,
+            },
             ..base
         },
         "codex" => HarnessDescriptor {
@@ -421,14 +553,14 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
             model: ModelSpec {
                 flag: Some("--model".into()),
                 default: default_model_choice(),
-                models: models(&["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]),
-                catalog: None,
+                models: Vec::new(),
+                catalog: Some(HarnessCatalog::Codex),
             },
             effort: EffortSpec {
                 config_flag: Some("-c".into()),
                 config_key: Some("model_reasoning_effort".into()),
                 default: default_model_choice(),
-                efforts: ["minimal", "low", "medium", "high", "xhigh"]
+                efforts: ["low", "medium", "high", "xhigh", "max"]
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
@@ -443,6 +575,11 @@ pub fn builtin(id: &str) -> Option<HarnessDescriptor> {
             },
             hooks: Some("codex".into()),
             relocation_prompt: true,
+            account: AccountSpec {
+                env: Some("CODEX_HOME".into()),
+                home: Some("~/.codex".into()),
+                dir: None,
+            },
             ..base
         },
         "cursor" => HarnessDescriptor {
@@ -686,6 +823,14 @@ pub struct HarnessOverride {
     pub relocation_prompt: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_model_effort: Option<bool>,
+    #[serde(default, skip_serializing_if = "Clearable::is_keep")]
+    pub account_env: Clearable<String>,
+    #[serde(default, skip_serializing_if = "Clearable::is_keep")]
+    pub account_home: Clearable<String>,
+    /// The global account folder (Settings → Agents → Account): the
+    /// harness's `account.dir`.
+    #[serde(default, skip_serializing_if = "Clearable::is_keep")]
+    pub account_dir: Clearable<String>,
 }
 
 impl HarnessDescriptor {
@@ -744,6 +889,9 @@ impl HarnessDescriptor {
         if let Some(compose) = over.compose_model_effort {
             self.compose_model_effort = compose;
         }
+        over.account_env.apply_to(&mut self.account.env);
+        over.account_home.apply_to(&mut self.account.home);
+        over.account_dir.apply_to(&mut self.account.dir);
     }
 }
 
@@ -826,6 +974,7 @@ impl CustomHarness {
             hooks: self.hooks.clone(),
             relocation_prompt: false,
             compose_model_effort: false,
+            account: AccountSpec::default(),
         }
     }
 
@@ -906,6 +1055,7 @@ pub fn registry(
             hooks: None,
             relocation_prompt: false,
             compose_model_effort: false,
+            account: AccountSpec::default(),
         };
         // A map-only entry that maps effort shows its Effort row like a
         // built-in; a bare program stays Model-only like a legacy custom.
@@ -995,6 +1145,9 @@ mod tests {
         assert_eq!(claude.resume.flag.as_deref(), Some("--resume"));
         assert!(claude.relocation_prompt);
         let codex = builtin("codex").unwrap();
+        assert_eq!(codex.model.catalog, Some(HarnessCatalog::Codex));
+        assert_eq!(HarnessCatalog::parse("codex"), Some(HarnessCatalog::Codex));
+        assert_eq!(HarnessCatalog::Codex.as_str(), "codex");
         assert_eq!(codex.permissions_flag.as_deref(), Some("--yolo"));
         assert_eq!(codex.resume.subcommand.as_deref(), Some("resume"));
         assert!(codex.resume.cd);
@@ -1167,5 +1320,84 @@ mod tests {
         };
         assert_eq!(claude_hooks.problem(), None);
         assert_eq!(claude_hooks.hook_dialect(), Some(crate::AgentKind::Claude));
+    }
+
+    #[test]
+    fn a_project_account_wins_over_the_global_one_and_blank_falls_through() {
+        let mut claude = builtin("claude").unwrap();
+        assert_eq!(claude.account_env(), Some("CLAUDE_CONFIG_DIR"));
+        // Nothing picked anywhere: no folder, the CLI decides.
+        assert_eq!(claude.account_for(None), None);
+        assert_eq!(claude.account_for(Some("  ")), None);
+        claude.account.dir = Some("~/.claude-work".into());
+        assert_eq!(claude.account_for(None).as_deref(), Some("~/.claude-work"));
+        assert_eq!(
+            claude.account_for(Some(" ~/.claude-work2 ")).as_deref(),
+            Some("~/.claude-work2")
+        );
+        // A blank project row is "global", not "no account".
+        assert_eq!(
+            claude.account_for(Some("")).as_deref(),
+            Some("~/.claude-work")
+        );
+    }
+
+    #[test]
+    fn a_harness_without_an_account_switch_never_gets_a_folder() {
+        let mut cursor = builtin("cursor").unwrap();
+        assert!(!cursor.has_accounts());
+        cursor.account.dir = Some("~/.cursor-work".into());
+        assert_eq!(cursor.account_for(Some("~/.cursor-x")), None);
+        // A blank env name is no switch either.
+        let mut codex = builtin("codex").unwrap();
+        assert_eq!(codex.account_env(), Some("CODEX_HOME"));
+        codex.account.env = Some("  ".into());
+        assert_eq!(codex.account_for(Some("~/.codex-work")), None);
+    }
+
+    #[test]
+    fn the_account_overrides_set_and_clear_through_the_map() {
+        let over: HarnessOverride = serde_json::from_str(
+            r#"{"account_dir": "~/.claude-work", "account_home": "/opt/claude"}"#,
+        )
+        .unwrap();
+        let mut claude = builtin("claude").unwrap();
+        claude.apply(&over);
+        assert_eq!(claude.account.dir.as_deref(), Some("~/.claude-work"));
+        assert_eq!(claude.account.home.as_deref(), Some("/opt/claude"));
+        assert_eq!(claude.account.env.as_deref(), Some("CLAUDE_CONFIG_DIR"));
+        let clear: HarnessOverride =
+            serde_json::from_str(r#"{"account_dir": null, "account_env": null}"#).unwrap();
+        claude.apply(&clear);
+        assert_eq!(claude.account.dir, None);
+        assert!(!claude.has_accounts());
+        // A map-only CLI can declare its own switch.
+        let agy: HarnessOverride = serde_json::from_str(
+            r#"{"program": "agy", "account_env": "AGY_HOME", "account_dir": "~/.agy-2"}"#,
+        )
+        .unwrap();
+        let rows = registry(&BTreeMap::from([("agy".to_string(), agy)]), &[]);
+        let agy = rows.iter().find(|row| row.id == "agy").unwrap();
+        assert_eq!(agy.account_for(None).as_deref(), Some("~/.agy-2"));
+    }
+
+    #[test]
+    fn account_dirs_expand_the_home_and_keep_absolute_paths() {
+        let home = crate::env::home_dir().unwrap();
+        assert_eq!(
+            expand_account_dir(" ~/.claude-work "),
+            Some(home.join(".claude-work"))
+        );
+        assert_eq!(expand_account_dir("~"), Some(home));
+        assert_eq!(
+            expand_account_dir("/Volumes/ssd/.claude"),
+            Some(std::path::PathBuf::from("/Volumes/ssd/.claude"))
+        );
+        // `~user` is not this user's home: kept as typed, never expanded.
+        assert_eq!(
+            expand_account_dir("~bob/.claude"),
+            Some(std::path::PathBuf::from("~bob/.claude"))
+        );
+        assert_eq!(expand_account_dir("   "), None);
     }
 }

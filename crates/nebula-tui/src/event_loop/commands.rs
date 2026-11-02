@@ -97,6 +97,7 @@ fn prompt_value_or_cancel(app: &mut App, prompt: PromptDialog) -> Option<(Prompt
         PromptKind::NewWorktree { .. }
         | PromptKind::RenameProject { .. }
         | PromptKind::SettingText { .. }
+        | PromptKind::AccountFolder { .. }
         | PromptKind::AgentPresetTask { .. } => true,
         PromptKind::QuickPrompt(launch) => launch.launches_empty(),
         _ => false,
@@ -293,6 +294,22 @@ fn dispatch_prompt(
             }
         }
 
+        PromptKind::AccountFolder { harness, project } => {
+            // The folder joins this harness's pickers and is picked at once,
+            // for the row the picker was opened from; empty adds nothing.
+            let mut cfg = crate::config::Config::load();
+            let picked = cfg.add_account_folder(&harness, &value);
+            if let Some(dir) = picked.clone() {
+                pick_account(&mut cfg, &harness, project.as_deref(), Some(dir));
+                if save_config(app, &cfg) {
+                    apply_config(app, &cfg);
+                }
+            }
+            reopen_settings(app);
+            if let (Some(dir), Some(view)) = (picked, settings_mut(app)) {
+                view.info(format!("account: {dir}"));
+            }
+        }
         PromptKind::IssueComment { view, issue } => {
             crate::issues::post_comment(app, view, issue, value);
         }
@@ -338,9 +355,7 @@ pub(crate) fn run_pending_action(
         PendingAction::DeleteAgent(id) => delete_agent(app, id, out),
         PendingAction::MoveAgent { id, worktree } => launcher::move_agent(app, id, worktree, out),
         PendingAction::CloseTerminal(id) => close_terminal(app, id, out),
-        PendingAction::DeleteLink(id) => {
-            send(app, out, |req_id| ClientRequest::DeleteLink { req_id, id });
-        }
+        PendingAction::DeleteLink(id) => optimistic::delete_link(app, id, out),
         PendingAction::DeleteWorktree(id) => delete_worktree_and_settle(app, id, out),
         PendingAction::ThenDeleteWorktree {
             first, worktree, ..
@@ -410,6 +425,9 @@ pub(crate) fn delete_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientReque
 
 /// Close a terminal tab, detaching the pane first if it's showing it.
 pub(crate) fn close_terminal(app: &mut App, id: TerminalId, out: &mut Vec<ClientRequest>) {
+    if terminal_create::cancel(app, &id, out) {
+        return;
+    }
     // The grid's cursor may be on this terminal's chip: `keep_cursor`
     // hands it to the neighbour once the row is gone, and the pane
     // follows it there.
@@ -550,9 +568,49 @@ pub(crate) fn delete_worktree(app: &mut App, id: WorktreeId, out: &mut Vec<Clien
     });
 }
 
+/// Write an ACCOUNT pick: the project at `project`'s row, or the global
+/// one when None.
+fn pick_account(
+    cfg: &mut crate::config::Config,
+    harness: &str,
+    project: Option<&std::path::Path>,
+    dir: Option<String>,
+) {
+    match project {
+        Some(path) => cfg.set_project_account(path, harness, dir),
+        None => cfg.set_global_account(harness, dir),
+    }
+}
+
 pub(crate) fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientRequest>) {
     match action {
         MenuAction::Attach(sref) => activate::attach(app, sref, out),
+        MenuAction::PickAccount {
+            harness,
+            project,
+            dir,
+        } => {
+            let mut cfg = crate::config::Config::load();
+            let shown = dir.clone();
+            pick_account(&mut cfg, &harness, project.as_deref(), dir);
+            let saved = save_config(app, &cfg);
+            if saved {
+                apply_config(app, &cfg);
+            }
+            reopen_settings(app);
+            if saved {
+                let value = shown.unwrap_or_else(|| match project {
+                    Some(_) => crate::config::GLOBAL_ACCOUNT_CHOICE.into(),
+                    None => nebula_core::harness::DEFAULT_CHOICE.into(),
+                });
+                if let Some(view) = settings_mut(app) {
+                    view.info(format!("account: {value}"));
+                }
+            }
+        }
+        MenuAction::AddAccountFolder { harness, project } => {
+            open_prompt(app, PromptKind::AccountFolder { harness, project });
+        }
         MenuAction::RestartAgent(id) => {
             send(app, out, |req_id| ClientRequest::RestartAgent {
                 req_id,

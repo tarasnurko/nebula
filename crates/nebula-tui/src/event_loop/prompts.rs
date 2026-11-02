@@ -39,6 +39,12 @@ pub(crate) fn quick_return_of(prompt: &PromptDialog) -> Option<crate::quick_prom
 }
 
 pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
+    if let PromptKind::RenameTerminal { id } = &kind {
+        if app.is_placeholder_session(&SessionRef::Terminal(id.clone())) {
+            app.chrome.flash = Some("terminal is still starting — rename it once ready".into());
+            return;
+        }
+    }
     use std::borrow::Cow;
     let (title, label, input): (Cow<'static, str>, Cow<'static, str>, String) = match &kind {
         // Starts on the folder nebula was started in — its parent listed,
@@ -179,6 +185,28 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
                 None => cfg.text_value(*kind),
             };
             (title.into(), hint.into(), value)
+        }
+        PromptKind::AccountFolder { harness, project } => {
+            let cfg = crate::config::Config::load();
+            let label = cfg
+                .effective_harness_by_id(harness)
+                .display_label()
+                .to_string();
+            let title = match project.as_deref().and_then(|path| {
+                app.tree
+                    .projects
+                    .iter()
+                    .find(|p| p.repo_path == path)
+                    .map(|p| p.name.clone())
+            }) {
+                Some(name) => format!("{label} account folder · {name}"),
+                None => format!("{label} account folder · every project"),
+            };
+            (
+                title.into(),
+                "folder path, e.g. /Volumes/ssd/.claude or ~/work/.claude (empty = back)".into(),
+                String::new(),
+            )
         }
 
         PromptKind::IssueComment { issue, .. } => {

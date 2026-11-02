@@ -144,7 +144,10 @@ pub(crate) fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                 }
             }
         }
-        Entity::Link(l) => upsert_by(&mut app.tree.links, l, |x, y| x.id == y.id),
+        Entity::Link(l) => {
+            app.github.pr_recheck.remove(&l.worktree_id);
+            upsert_by(&mut app.tree.links, l, |x, y| x.id == y.id);
+        }
     }
 }
 
@@ -285,6 +288,14 @@ pub(crate) struct SelectionSnapshot {
     /// hands the cursor to a neighbor in its own group when it can.
     session_index: usize,
     session_group: Option<SessionGroup>,
+}
+
+impl SelectionSnapshot {
+    pub(crate) fn remap_session(&mut self, from: &SessionRef, to: &SessionRef) {
+        if self.session.as_ref() == Some(from) {
+            self.session = Some(to.clone());
+        }
+    }
 }
 
 /// The Sessions panel's groups, in the order it lists them: the live

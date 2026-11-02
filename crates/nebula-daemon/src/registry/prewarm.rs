@@ -29,6 +29,11 @@ impl Daemon {
         else {
             return Ok(());
         };
+        // The spare boots on the ACCOUNT a create here would start on now.
+        let Ok(harness) = resolve_harness(kind, None) else {
+            return Ok(());
+        };
+        let account = self.launch_account(&worktree, &harness)?;
         let stale = {
             // One warm slot per key; keep a live, young one with the same
             // spec, replace a dead, wrong-spec, or aging one (recycling
@@ -38,6 +43,7 @@ impl Daemon {
                 if self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
                     && entry.model == model
                     && entry.effort == effort
+                    && entry.account == account
                     && entry.spawned_at.elapsed() < PREWARM_RECYCLE_AGE
                 {
                     return Ok(());
@@ -48,7 +54,7 @@ impl Daemon {
             }
         };
         if let Some(old) = stale {
-            self.kill_session(&SessionRef::Agent(old.agent_id));
+            self.drop_spare(old.agent_id);
         }
         if !self.cli_available(kind.cli_program()).await {
             tracing::debug!(kind = kind.as_str(), "prewarm skipped: CLI not installed");
@@ -75,7 +81,13 @@ impl Daemon {
             role: nebula_core::AgentRole::Worker,
             recent_prompts: Vec::new(),
         };
-        self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS)?;
+        self.spare_accounts
+            .lock()
+            .insert(agent.id.clone(), account.clone());
+        if let Err(e) = self.spawn_agent_session(&agent, &worktree, DEFAULT_COLS, DEFAULT_ROWS) {
+            self.spare_accounts.lock().remove(&agent.id);
+            return Err(e);
+        }
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
         let replaced = self.prewarmed.lock().insert(
             (worktree_id.clone(), kind),
@@ -84,13 +96,14 @@ impl Daemon {
                 spawned_at: Instant::now(),
                 model,
                 effort,
+                account,
                 buffered_hooks: Vec::new(),
             },
         );
         // Two racing prewarms for the same key: the loser's session would
         // otherwise leak as an orphan CLI process.
         if let Some(old) = replaced {
-            self.kill_session(&SessionRef::Agent(old.agent_id));
+            self.drop_spare(old.agent_id);
         }
         Ok(())
     }
@@ -105,16 +118,29 @@ impl Daemon {
         kind: AgentKind,
         model: Option<&str>,
         effort: Option<&str>,
+        account: &str,
     ) -> Option<PrewarmEntry> {
         let entry = self.prewarmed.lock().remove(&(worktree_id.clone(), kind))?;
+        // Adopted or not, the spare is no longer one: an adopted row keeps
+        // its account in the store from here.
+        self.spare_accounts.lock().remove(&entry.agent_id);
         if !self.is_alive(&SessionRef::Agent(entry.agent_id.clone())) {
             return None;
         }
-        if entry.model.as_deref() != model || entry.effort.as_deref() != effort {
+        if entry.model.as_deref() != model
+            || entry.effort.as_deref() != effort
+            || entry.account != account
+        {
             self.kill_session(&SessionRef::Agent(entry.agent_id));
             return None;
         }
         Some(entry)
+    }
+
+    /// Kill a warm spare and forget the account it booted on.
+    fn drop_spare(&self, id: AgentId) {
+        self.spare_accounts.lock().remove(&id);
+        self.kill_session(&SessionRef::Agent(id));
     }
 
     /// Drop warm sessions that died or sat unclaimed past the max age —
@@ -147,7 +173,7 @@ impl Daemon {
         };
         for id in doomed {
             tracing::debug!(agent = %id, "reaping prewarmed session");
-            self.kill_session(&SessionRef::Agent(id));
+            self.drop_spare(id);
         }
     }
 
@@ -192,7 +218,7 @@ impl Daemon {
                 .collect()
         };
         for id in doomed {
-            self.kill_session(&SessionRef::Agent(id));
+            self.drop_spare(id);
         }
     }
 

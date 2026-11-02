@@ -94,6 +94,9 @@ impl Daemon {
                     .context("worktree not found")
             })
             .await?;
+        // The ACCOUNT this session runs on for good: its project's pick,
+        // else the harness's global one, kept with the row below.
+        let account = self.launch_account(&worktree, &harness)?;
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. A starting prompt rides the
@@ -103,7 +106,15 @@ impl Daemon {
             && pr_url.is_none()
             && issue_url.is_none()
             && starting_prompt.is_none())
-        .then(|| self.take_prewarmed(&worktree_id, kind, model.as_deref(), effort.as_deref()))
+        .then(|| {
+            self.take_prewarmed(
+                &worktree_id,
+                kind,
+                model.as_deref(),
+                effort.as_deref(),
+                &account,
+            )
+        })
         .flatten();
         // Only the cold path needs asking: an adopted warm session is proof
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
@@ -165,6 +176,7 @@ impl Daemon {
         let pr_to_insert = pr_url.clone();
         let issue_to_insert = issue_url.clone();
         let prompt_to_insert = prompt_entry.clone();
+        let account_to_insert = harness.has_accounts().then(|| account.clone());
         self.store_blocking(move |store| {
             store.insert_agent_with_launch_context(
                 &agent_to_insert,
@@ -172,6 +184,9 @@ impl Daemon {
                 pr_to_insert.as_deref(),
                 issue_to_insert.as_deref(),
             )?;
+            if let Some(dir) = &account_to_insert {
+                store.set_agent_account(&agent_to_insert.id, dir)?;
+            }
             if let Some(entry) = &prompt_to_insert {
                 store.push_prompt(&agent_to_insert.id, entry)?;
             }
@@ -411,6 +426,11 @@ impl Daemon {
         // its reason rather than launching the wrong CLI, and the same
         // descriptor picks the hook dialect below.
         let harness = resolve_harness(agent.kind, agent.custom_harness.as_deref())?;
+        // The ACCOUNT folder the CLI runs on, the one the row was started
+        // on: its env var below, Codex's hooks, and where Claude's
+        // transcript is looked for all follow it.
+        let account_dir =
+            nebula_core::harness::expand_account_dir(&self.agent_account(agent, &harness));
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn. The dialect is data: a custom
         // harness naming one reports status, prompts and permission waits
@@ -421,10 +441,12 @@ impl Daemon {
             // Codex's hooks live in its home, not the worktree, so one
             // trust approval covers every worktree (see installer docs);
             // any per-worktree copy an older nebula left is pruned.
-            Some(AgentKind::Codex) => {
-                hooks::installer::install_codex_hooks(&hooks::installer::codex_home())
-                    .and_then(|()| hooks::installer::prune_codex_worktree_hooks(&worktree.path))
-            }
+            Some(AgentKind::Codex) => hooks::installer::install_codex_hooks(
+                &account_dir
+                    .clone()
+                    .unwrap_or_else(hooks::installer::codex_home),
+            )
+            .and_then(|()| hooks::installer::prune_codex_worktree_hooks(&worktree.path)),
             // Cursor also gets the managed auto-title project rule — its
             // hook dialect has no context-injection channel.
             Some(AgentKind::Cursor) => hooks::installer::install_cursor_hooks(&worktree.path)
@@ -462,8 +484,10 @@ impl Daemon {
                     && cloud_task.is_none()
                     && cmd_override.is_none()
                     && attach.is_none()
-                    && claude_transcript_exists(&self.claude_projects_dirs(), sid)
-                        == Some(false) =>
+                    && claude_transcript_exists(
+                        &self.claude_projects_dirs_in(account_dir.as_deref()),
+                        sid,
+                    ) == Some(false) =>
             {
                 tracing::info!(agent = %agent.id, session = %sid, "no Claude transcript for the session — spawning fresh");
                 if let Err(e) = self.store.set_agent_session_id(&agent.id, None) {
@@ -590,7 +614,10 @@ impl Daemon {
                     format!("http://127.0.0.1:{}", self.hook_env.port),
                 ),
                 (env::API_TOKEN.into(), self.hook_env.token.clone()),
-            ],
+            ]
+            .into_iter()
+            .chain(account_env_pair(&harness, account_dir.as_deref()))
+            .collect(),
             scrub_env: env::AGENT_SESSION_VARS,
             cols,
             rows,
@@ -667,7 +694,7 @@ impl Daemon {
         // quit over something else — a bad flag, a login: keep the id for
         // the next attach, and the pane keeps the CLI's reason.
         if agent.kind == AgentKind::Claude
-            && claude_transcript_exists(&self.claude_projects_dirs(), &sid) == Some(true)
+            && claude_transcript_exists(&self.claude_projects_dirs_for(&agent), &sid) == Some(true)
         {
             // One reason Claude refuses a good id: the session runs in its
             // background daemon now, and only `claude attach` opens it. The
@@ -750,7 +777,7 @@ impl Daemon {
         let Some(sid) = claude_resumable_session(agent) else {
             return false;
         };
-        self.claude_projects_dirs()
+        self.claude_projects_dirs_for(agent)
             .iter()
             .filter_map(|projects| projects.parent())
             .any(|config| claude_bg::job_hint(config, sid))
@@ -768,7 +795,18 @@ impl Daemon {
             agent.kind.cli_program(),
             &listing,
         );
-        let id = claude_bg::probe(&program, &args, sid)?;
+        let env: Vec<(String, String)> =
+            resolve_harness(agent.kind, agent.custom_harness.as_deref())
+                .ok()
+                .and_then(|harness| {
+                    let dir = nebula_core::harness::expand_account_dir(
+                        &self.agent_account(agent, &harness),
+                    );
+                    account_env_pair(&harness, dir.as_deref())
+                })
+                .into_iter()
+                .collect();
+        let id = claude_bg::probe(&program, &args, &env, sid)?;
         tracing::info!(agent = %agent.id, session = %sid, attach = %id, "Claude session runs in the background");
         Some(id)
     }
@@ -776,6 +814,93 @@ impl Daemon {
     /// Every Claude projects dir a transcript may sit in: the ones this
     /// daemon's Claude hooks reported (wherever the agent's shell pointed
     /// `CLAUDE_CONFIG_DIR`), then the default.
+    pub(super) fn claude_projects_dirs_for(&self, agent: &Agent) -> Vec<PathBuf> {
+        let account = resolve_harness(agent.kind, agent.custom_harness.as_deref())
+            .ok()
+            .and_then(|harness| {
+                nebula_core::harness::expand_account_dir(&self.agent_account(agent, &harness))
+            });
+        self.claude_projects_dirs_in(account.as_deref())
+    }
+
+    /// [`Self::claude_projects_dirs`] with an agent's ACCOUNT folder first:
+    /// a session started on `~/.claude-work2` keeps its transcript there,
+    /// which no hook may have named since this daemon booted.
+    pub(super) fn claude_projects_dirs_in(&self, account: Option<&Path>) -> Vec<PathBuf> {
+        let mut dirs = self.claude_projects_dirs();
+        if let Some(account) = account {
+            let projects = account.join("projects");
+            if !dirs.contains(&projects) {
+                dirs.insert(0, projects);
+            }
+        }
+        dirs
+    }
+
+    /// The ACCOUNT folder a new `harness` session in `worktree` starts on,
+    /// as picked ("" = none passed): the project's pick in Settings →
+    /// Project, else the harness's global one (Settings → Agents).
+    pub(super) fn launch_account(
+        &self,
+        worktree: &Worktree,
+        harness: &nebula_core::harness::HarnessDescriptor,
+    ) -> Result<String> {
+        self.launch_account_in(&crate::config::Config::load(), worktree, harness)
+    }
+
+    /// [`Self::launch_account`] against an explicit config.
+    pub(super) fn launch_account_in(
+        &self,
+        config: &crate::config::Config,
+        worktree: &Worktree,
+        harness: &nebula_core::harness::HarnessDescriptor,
+    ) -> Result<String> {
+        if !harness.has_accounts() {
+            return Ok(String::new());
+        }
+        let repo = self
+            .store
+            .get_project(&worktree.project_id)?
+            .map(|p| p.repo_path);
+        let project = repo
+            .as_deref()
+            .and_then(|repo| config.project_account(repo, &harness.id));
+        Ok(harness.account_for(project).unwrap_or_default())
+    }
+
+    /// The ACCOUNT folder `agent`'s CLI runs on, as picked ("" = none
+    /// passed). A row keeps the one it was started on, so a later pick —
+    /// its project's or the global one — never moves its conversation
+    /// away from its CLI; a warm spare carries the one it booted on; a row
+    /// from before accounts were kept takes today's global pick and keeps
+    /// it from then on.
+    pub(super) fn agent_account(
+        &self,
+        agent: &Agent,
+        harness: &nebula_core::harness::HarnessDescriptor,
+    ) -> String {
+        if !harness.has_accounts() {
+            return String::new();
+        }
+        if let Some(dir) = self.spare_accounts.lock().get(&agent.id) {
+            return dir.clone();
+        }
+        match self.store.agent_account(&agent.id) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => {
+                let dir = legacy_account(agent, harness);
+                if let Err(e) = self.store.set_agent_account(&agent.id, &dir) {
+                    tracing::warn!(agent = %agent.id, error = %e, "keeping the account failed");
+                }
+                dir
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent.id, error = %e, "reading the account failed");
+                harness.account_for(None).unwrap_or_default()
+            }
+        }
+    }
+
     pub(super) fn claude_projects_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = self
             .transcripts

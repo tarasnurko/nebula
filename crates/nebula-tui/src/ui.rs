@@ -218,7 +218,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.chrome.rows_memo.disarm();
     if app.chrome.black_background {
         let area = f.area();
-        draw_black_background(f.buffer_mut(), area);
+        draw_black_background(f.buffer_mut(), area, app.chrome.theme);
     }
 }
 
@@ -415,9 +415,20 @@ pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String>
             "Tab: cloud off  "
         }
     });
+    // A submenu backs out; a picker opened from the QUICK PROMPT is owed
+    // its box back.
+    let esc = if menu.parent.is_some() {
+        "Esc: back"
+    } else if crate::event_loop::menu_quick_return(menu).is_some_and(|back| back.from_box) {
+        "Esc: back to the box"
+    } else {
+        "Esc: close"
+    };
+    // The picker's own keys lead, the self-evident ones trail, so a
+    // narrow footer cuts ↑/↓ before it cuts `?`.
     if menu.filter.is_some() {
         return Some(format!(
-            "{}type to filter  ↑/↓: move  Backspace: widen  {}Enter: pick  Esc: back",
+            "{}{}type to filter  Enter: pick  {esc}  ↑/↓: move  Backspace: widen",
             cloud.unwrap_or(""),
             if agent_jump { "?: settings  " } else { "" }
         ));
@@ -425,12 +436,6 @@ pub(crate) fn menu_footer_hint(menu: &crate::app::ContextMenu) -> Option<String>
     if cloud.is_none() && !agent_jump {
         return None;
     }
-    // A picker opened from the QUICK PROMPT is owed its box back.
-    let esc = if crate::event_loop::menu_quick_return(menu).is_some_and(|back| back.from_box) {
-        "Esc: back to the box"
-    } else {
-        "Esc: close"
-    };
     Some(format!(
         "{}s/?: settings  Enter: pick  {esc}",
         cloud.unwrap_or("")
@@ -919,16 +924,17 @@ fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
 }
 
 /// The BLACK BACKGROUND setting: paint every cell still on the terminal's
-/// default background pure black. Runs last in a frame, after the overlays
+/// default background the theme's canvas — pure black, or pure white in
+/// the light APPEARANCE. Runs last in a frame, after the overlays
 /// and the focus tint, and — like the tint — only touches `Reset` cells, so
 /// selection fills, the tint and the colors a session draws itself stay on
 /// top of it.
-fn draw_black_background(buf: &mut ratatui::buffer::Buffer, area: Rect) {
+fn draw_black_background(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 if cell.bg == Color::Reset {
-                    cell.bg = crate::theme::BLACK_BACKGROUND;
+                    cell.bg = th.canvas();
                 }
             }
         }
@@ -1599,7 +1605,12 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         // (A live session's replay lands within a frame; that blank is
         // not worth a word that would only flash.)
         Some(t) if t.booting => Some(Span::styled(
-            "starting…".to_string(),
+            if app.pane_resuming() {
+                "resuming…"
+            } else {
+                "starting…"
+            }
+            .to_string(),
             Style::default().fg(th.dim),
         )),
         // The LAUNCHER VIEW's pane says nothing of the lock: its header's
@@ -1652,8 +1663,16 @@ fn draw_terminal_body(
             draw_refused_terminal(f, inner, th, term.refused.clone().unwrap_or_default());
             (Vec::new(), Vec::new())
         }
-        Some(term) if term.booting && !term.exited => {
-            draw_booting_terminal(f, inner, th);
+        Some(term) if term.replay.is_some() || (term.booting && !term.exited) => {
+            let notice = if term.replay.is_some() {
+                BootNotice::Replaying
+            } else if app.pane_resuming() {
+                BootNotice::Resuming
+            } else {
+                BootNotice::Starting
+            };
+            let spinner = app.chrome.animations.then(crate::app::now_ms);
+            draw_booting_terminal(f, inner, th, notice, spinner);
             (Vec::new(), Vec::new())
         }
         Some(term) => {
@@ -1663,10 +1682,7 @@ fn draw_terminal_body(
             stamp_hyperlinks(screen, inner, f.buffer_mut());
             app.pane.host_cursor = pty_cursor_cell(screen, inner);
             draw_terminal_selection(f, app, screen, inner);
-            (
-                crate::links::visible_links(term.parser.screen()),
-                crate::links::visible_file_links(term.parser.screen()),
-            )
+            crate::links::visible_terminal_links(screen)
         }
         // The LAUNCHER VIEW's pane with nothing in it is an empty panel: the
         // strip over it already says which key opens a terminal here.
@@ -1698,21 +1714,74 @@ fn draw_refused_terminal(f: &mut Frame, inner: Rect, th: Theme, why: String) {
     f.render_widget(msg, padded);
 }
 
-fn draw_booting_terminal(f: &mut Frame, inner: Rect, th: Theme) {
-    let msg = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
+/// What the pane is waiting on while its grid is blank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootNotice {
+    /// A big replay is being parsed off the UI thread.
+    Replaying,
+    /// An agent CLI is reopening a stored conversation (`--resume`): the
+    /// IDLE REAPER took it while the user was elsewhere, and the CLI can
+    /// take seconds to load the transcript before it draws.
+    Resuming,
+    /// A new session, or one with nothing to resume, is booting.
+    Starting,
+}
+
+/// Braille spinner frames for the booting notice, one per [`SWEEP_FRAME`].
+///
+/// [`SWEEP_FRAME`]: crate::app::SWEEP_FRAME
+const BOOT_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The blank pane's notice. `spinner` is the clock (ms) the spinner turns
+/// on, or None with animations off — then a still dot stands in.
+fn draw_booting_terminal(
+    f: &mut Frame,
+    inner: Rect,
+    th: Theme,
+    notice: BootNotice,
+    spinner: Option<i64>,
+) {
+    let (title, detail) = match notice {
+        BootNotice::Replaying => ("loading session…", "restoring the terminal screen"),
+        BootNotice::Resuming => (
+            "resuming session…",
+            "picking the conversation back up — it appears as soon as it paints",
+        ),
+        BootNotice::Starting => (
             "starting session…",
-            Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
             "booting — the screen appears as soon as it paints",
-            Style::default().fg(th.dim),
-        )),
+        ),
+    };
+    let glyph = match spinner {
+        Some(ms) => {
+            let tick = ms.max(0) as u128 / crate::app::SWEEP_FRAME.as_millis();
+            BOOT_SPINNER[(tick % BOOT_SPINNER.len() as u128) as usize]
+        }
+        None => '·',
+    };
+    // Vertically centred: a notice pinned to the top of a tall pane reads
+    // as a header over an empty, possibly broken, screen.
+    let lines = 3;
+    let top = inner.height.saturating_sub(lines) / 2;
+    let area = Rect {
+        y: inner.y + top,
+        height: inner.height.saturating_sub(top),
+        ..inner
+    };
+    let msg = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(th.accent)),
+            Span::styled(
+                title,
+                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(detail, Style::default().fg(th.dim))),
     ])
+    .wrap(Wrap { trim: false })
     .centered();
-    f.render_widget(msg, inner);
+    f.render_widget(msg, area);
 }
 
 fn draw_terminal_selection(f: &mut Frame, app: &App, screen: &vt100::Screen, inner: Rect) {
@@ -2454,6 +2523,74 @@ mod tests {
         assert!(!text.contains("starting session"), "{text}");
     }
 
+    /// Opening an idle session the reaper took: the CLI's first bytes are
+    /// mode switches, and the pane goes on saying it is resuming — with a
+    /// spinner the loop keeps turning — until the CLI draws.
+    #[test]
+    fn a_reaped_session_says_it_is_resuming_until_it_draws() {
+        let mut app = App::new();
+        let id = nebula_core::ids::AgentId("a1".into());
+        app.tree.agents.push(nebula_core::Agent {
+            id: id.clone(),
+            worktree_id: nebula_core::ids::WorktreeId("w1".into()),
+            name: "fix login".into(),
+            status: nebula_core::AgentStatus::Finished,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            status_changed_at: 0,
+            kind: nebula_core::AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: Some("4b7c".into()),
+            cloud_session_id: None,
+            sort_order: 0,
+            alive: false,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+            recent_prompts: Vec::new(),
+        });
+        let mut term = crate::app::AttachedTerm::new(SessionRef::Agent(id), 60, 12);
+        term.booting = true;
+        term.apply_scrollback(0, b"");
+        term.apply_output(0, b"\x1b[?25l\x1b[?2004h\x1b[?1004h");
+        app.pane.term = Some(term);
+        app.chrome.animations = true;
+        assert!(app.boot_spinner_active(), "the spinner asks for frames");
+        let render = |app: &mut App| {
+            let area = Rect::new(0, 0, 64, 16);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(64, 16)).unwrap();
+            terminal.draw(|f| draw_terminal(f, app, area)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..16)
+                .map(|y| {
+                    (0..64)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>()
+        };
+        let text = render(&mut app);
+        assert!(text.contains("resuming session…"), "{text}");
+        assert!(text.contains("resuming…"), "the header says it too: {text}");
+        assert!(!text.contains("starting session"), "{text}");
+
+        app.pane
+            .term
+            .as_mut()
+            .unwrap()
+            .apply_output(22, b"\x1b[H> resumed");
+        assert!(!app.boot_spinner_active());
+        let text = render(&mut app);
+        assert!(
+            text.contains("> resumed") && !text.contains("resuming"),
+            "{text}"
+        );
+    }
+
     /// The BLACK BACKGROUND setting leaves nothing on the terminal's own
     /// background once a frame is drawn, and paints only what was: a cell
     /// something else filled keeps its color.
@@ -2474,13 +2611,20 @@ mod tests {
         let area = Rect::new(0, 0, 2, 1);
         let mut buf = ratatui::buffer::Buffer::empty(area);
         buf[(1, 0)].bg = app.chrome.theme.sel_bg;
-        draw_black_background(&mut buf, area);
+        draw_black_background(&mut buf, area, app.chrome.theme);
         assert_eq!(buf[(0, 0)].bg, crate::theme::BLACK_BACKGROUND);
         assert_eq!(
             buf[(1, 0)].bg,
             app.chrome.theme.sel_bg,
             "a fill stays on top"
         );
+
+        // The light APPEARANCE paints the same cells white instead: a
+        // black slab under dark-on-light text is what it exists to avoid.
+        let light = crate::theme::Theme::light_by_name("default");
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        draw_black_background(&mut buf, area, light);
+        assert_eq!(buf[(0, 0)].bg, crate::theme::WHITE_BACKGROUND);
     }
 
     #[test]
@@ -2763,5 +2907,84 @@ mod tests {
             None,
             "and then it holds still"
         );
+    }
+}
+
+#[cfg(test)]
+mod performance_probes {
+    #[test]
+    #[ignore = "manual rendering benchmark; run with --ignored --nocapture"]
+    fn large_pull_request_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::with_config_path(dir.path().join("config.json"), || {
+            let mut files = Vec::new();
+            let mut chunks = std::collections::HashMap::new();
+            for i in 0..250 {
+                let path = format!("src/file_{i}.rs");
+                files.push(crate::git_diff::DiffFile {
+                    path: path.clone(),
+                    orig_path: None,
+                    xy: ['M', ' '],
+                });
+                chunks.insert(
+                    path,
+                    "@@ -1 +1 @@\n-old content\n+new content\n".repeat(1000),
+                );
+            }
+            let mut view =
+                crate::app::DiffView::new(dir.path().into(), "Large PR".into(), files, true);
+            view.split = false;
+            view.prefetched = Some(std::sync::Arc::new(chunks));
+            crate::git_diff::load_selected_diff(&mut view);
+            let mut app = crate::app::App::new();
+            app.modals.overlay = Some(crate::app::Overlay::Diff(view));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(190, 50)).unwrap();
+            terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            let started = std::time::Instant::now();
+            for i in 0..100 {
+                if let Some(crate::app::Overlay::Diff(view)) = &mut app.modals.overlay {
+                    view.scroll = i;
+                }
+                terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            }
+            eprintln!(
+                "large PR scroll: {:.3} ms/frame",
+                started.elapsed().as_secs_f64() * 10.0
+            );
+        });
+    }
+    #[test]
+    #[ignore = "manual rendering benchmark; run with --ignored --nocapture"]
+    fn large_document_scroll_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.md");
+        let content = "## Reading a large document\n\nA paragraph with **bold**, `code`, and [a link](https://example.com).\n\n".repeat(2000);
+        std::fs::write(&path, content).unwrap();
+        crate::config::with_config_path(dir.path().join("config.json"), || {
+            let mut app = crate::app::App::new();
+            app.modals.overlay = Some(crate::app::Overlay::FileTabs(
+                crate::file_tabs::FileTabsView::with_jobs(
+                    dir.path().into(),
+                    "vim".into(),
+                    vec![path],
+                    None,
+                ),
+            ));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(190, 50)).unwrap();
+            terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            let started = std::time::Instant::now();
+            for i in 0..100 {
+                if let Some(crate::app::Overlay::FileTabs(view)) = &mut app.modals.overlay {
+                    view.scroll = i;
+                }
+                terminal.draw(|f| super::draw(f, &mut app)).unwrap();
+            }
+            eprintln!(
+                "large markdown scroll: {:.3} ms/frame",
+                started.elapsed().as_secs_f64() * 10.0
+            );
+        });
     }
 }

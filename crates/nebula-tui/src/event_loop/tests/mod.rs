@@ -2923,6 +2923,7 @@ fn seed_branch_pr(app: &mut App, number: u64, title: &str) {
     app.github.pull_requests.insert(
         nebula_core::WorktreeId("w1".into()),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number,
             url: format!("https://github.com/o/r/pull/{number}"),
             title: title.into(),
@@ -3342,6 +3343,77 @@ diff --git a/src/b.rs b/src/b.rs
     assert!(!view.diff.contains("+new"), "chunks don't bleed");
 }
 
+/// Ctrl+o on a changed file in the DIFF VIEWER is the editor: a pull
+/// request's diff has no checkout to edit and a deleted file nothing left
+/// to open, so both say so; the viewer stays up either way.
+#[test]
+fn ctrl_o_on_a_diff_file_opens_the_editor_or_says_why_not() {
+    let mut app = pr_diff_app(false);
+    let mut out = Vec::new();
+    press(
+        &mut app,
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+        &mut out,
+    );
+    assert!(
+        app.chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("pull request")),
+        "flash: {:?}",
+        app.chrome.flash
+    );
+    assert!(app.pane.vim.is_none());
+    diff_view(&app);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("kept.rs"), "a\nb\n").unwrap();
+    let files = vec![
+        crate::git_diff::DiffFile {
+            path: "gone.rs".into(),
+            orig_path: None,
+            xy: [' ', 'D'],
+        },
+        crate::git_diff::DiffFile {
+            path: "kept.rs".into(),
+            orig_path: None,
+            xy: [' ', 'M'],
+        },
+    ];
+    let mut app = App::new();
+    let view = DiffView::new(dir.path().to_path_buf(), "main".into(), files, true);
+    app.modals.overlay = Some(Overlay::Diff(view));
+    press(
+        &mut app,
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+        &mut out,
+    );
+    assert!(
+        app.chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("gone.rs")),
+        "flash: {:?}",
+        app.chrome.flash
+    );
+
+    // A file on disk goes to the editor; with no editor channel (a unit
+    // test) nothing spawns, and nothing is flashed or folded either.
+    app.chrome.flash = None;
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+    assert_eq!(diff_view(&app).selected_path(), Some("kept.rs"));
+    press(
+        &mut app,
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+        &mut out,
+    );
+    assert_eq!(app.chrome.flash, None);
+    assert_eq!(diff_view(&app).selected_path(), Some("kept.rs"));
+}
+
 /// A pull request's diff spread over two directories, one of them a
 /// chain the tree folds into a single row.
 const TREE_PR_DIFF: &str = "\
@@ -3632,6 +3704,7 @@ fn a_failed_pr_diff_flashes_instead_of_opening() {
 /// A pull request as the cache would hand it back, for the rows.
 fn cached_pr(number: u64) -> crate::pull_request::PullRequest {
     crate::pull_request::PullRequest {
+        reported: false,
         number,
         url: pr_url(number),
         title: format!("PR {number}"),
@@ -4255,6 +4328,7 @@ fn shift_r_on_the_pr_row_refreshes_pull_requests() {
     app.github.pull_requests.insert(
         wid.clone(),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number: 7,
             url: url.clone(),
             title: "Attach links".into(),
@@ -4535,6 +4609,7 @@ fn a_found_pr_keeps_being_refreshed() {
     app.github.pull_requests.insert(
         wt.clone(),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number: 7,
             url: "https://github.com/o/r/pull/7".into(),
             title: "done".into(),
@@ -4568,6 +4643,7 @@ fn opening_a_pull_request_marks_it_read() {
     app.github.pull_requests.insert(
         wt.clone(),
         Some(crate::pull_request::PullRequest {
+            reported: false,
             number: 7,
             url: url.into(),
             title: "done".into(),
@@ -5989,7 +6065,20 @@ fn quit_asks_before_it_closes_the_tui() {
 /// pin the config to an empty temp file to stay off the dev's real one.
 pub(super) fn with_default_config<T>(f: impl FnOnce() -> T) -> T {
     let dir = tempfile::tempdir().unwrap();
-    crate::config::with_config_path(dir.path().join("config.json"), f)
+    // Models and effort strings deliberately come from a fake runtime
+    // catalog, so these flows also cover future names without a CLI.
+    let entries: Vec<_> = ["gpt-future-sol", "gpt-future-terra", "gpt-future-luna"]
+        .iter()
+        .map(|model| {
+            serde_json::json!({
+                "model": model,
+                "supportedReasoningEfforts": [{"reasoningEffort": "future-effort"}]
+            })
+        })
+        .collect();
+    crate::codex_catalogue::with_test_catalogue(&entries, || {
+        crate::config::with_config_path(dir.path().join("config.json"), f)
+    })
 }
 
 /// Pin the config to a temp file holding `json` for the duration of `f`.
@@ -6246,7 +6335,7 @@ fn tab_in_a_claude_submenu_toggles_cloud_for_the_whole_launch() {
         assert_eq!(menu(&app).hovered_claude_cloud(), Some(false));
         assert_eq!(
                 ui::menu_footer_hint(menu(&app)).as_deref(),
-                Some("Tab: cloud off  type to filter  ↑/↓: move  Backspace: widen  ?: settings  Enter: pick  Esc: back")
+                Some("Tab: cloud off  ?: settings  type to filter  Enter: pick  Esc: back  ↑/↓: move  Backspace: widen")
             );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
         assert_eq!(menu(&app).items[2].label, "opus", "a model row stays one");
@@ -6563,28 +6652,30 @@ fn question_mark_jumps_from_picker_to_harness_settings() {
     })
 }
 
-/// `s` jumps like `?` on the filter-less picker, but types in the
-/// model submenu, where it narrows the list instead.
+/// `s` types in the harness pickers and their model submenus, where
+/// it narrows the list, and still jumps like `?` from a PR row's
+/// menu, which has no filter to eat it.
 #[test]
-fn s_jumps_on_the_picker_and_types_in_submenus() {
+fn s_types_in_the_pickers_and_jumps_from_a_pr_row_menu() {
     use crate::config::{agents_tab, locate_agent, HarnessField};
     with_default_config(|| {
         let mut app = App::new();
         seed_tree(&mut app);
         app.nav.focus = Focus::Sessions;
         let mut out = Vec::new();
+        let worktree = app.selected_worktree().unwrap().id.clone();
 
+        // In the picker `s` is a filter letter: Muse is the one match.
         open_picker(&mut app);
-        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
-        let Some(Overlay::Settings(view)) = &app.modals.overlay else {
-            panic!("expected settings, got {:?}", app.modals.overlay);
+        let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+            panic!("`s` narrows instead of jumping: {:?}", app.modals.overlay);
         };
-        let (tab, row) = locate_agent("codex", HarnessField::Enabled).unwrap();
-        assert_eq!(tab, agents_tab());
-        assert_eq!((view.tab, view.selected), (tab, row));
+        assert_eq!(menu.filter_query(), "s");
+        assert_eq!(menu.items[menu.hover].label, "Muse");
 
-        // In a model submenu `s` is a filter letter, not a jump.
+        // In a model submenu too.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         open_picker(&mut app);
         press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
@@ -6598,6 +6689,35 @@ fn s_jumps_on_the_picker_and_types_in_submenus() {
                 .any(|r| matches!(r, ClientRequest::CreateAgent { .. })),
             "filtering must not create anything"
         );
+
+        // A PR row's menu has no filter: `s` jumps there.
+        let pr = crate::pull_request::OpenPr {
+            number: 7,
+            title: "Attach links".into(),
+            url: pr_url(7),
+            is_draft: false,
+            health: Default::default(),
+            base: "main".into(),
+            head: "pr-7-head".into(),
+        };
+        let mut items = crate::agent_picker::pr_session_menu_rows(worktree, &pr);
+        items.truncate(2);
+        app.modals.overlay = Some(Overlay::Menu(ContextMenu {
+            title: None,
+            items,
+            at: None,
+            hover: 1,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }));
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Settings(view)) = &app.modals.overlay else {
+            panic!("expected settings, got {:?}", app.modals.overlay);
+        };
+        let (tab, row) = locate_agent("codex", HarnessField::Enabled).unwrap();
+        assert_eq!(tab, agents_tab());
+        assert_eq!((view.tab, view.selected), (tab, row));
     })
 }
 
@@ -6632,7 +6752,7 @@ fn question_mark_ignores_menus_without_session_rows() {
         let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("s/?: settings"), "footer names it:\n{text}");
+        assert!(text.contains("?: settings"), "footer names it:\n{text}");
     })
 }
 
@@ -6644,7 +6764,7 @@ fn picker_enter_on_effort_row_carries_model_and_effort() {
         app.nav.focus = Focus::Sessions;
         let mut out = Vec::new();
 
-        // n → Codex row → models → Luna → efforts → minimal → Enter.
+        // n → Codex row → models → Luna → efforts → future-effort → Enter.
         open_picker(&mut app);
         press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
@@ -6652,11 +6772,14 @@ fn picker_enter_on_effort_row_carries_model_and_effort() {
             panic!("expected codex model submenu");
         };
         assert_eq!(menu.title.as_deref(), Some("Codex model"));
-        assert!(menu.items.iter().any(|item| item.label == "gpt-5.6-terra"));
+        assert!(menu
+            .items
+            .iter()
+            .any(|item| item.label == "gpt-future-terra"));
         let luna = menu
             .items
             .iter()
-            .position(|item| item.label.starts_with("gpt-5.6-luna"))
+            .position(|item| item.label.starts_with("gpt-future-luna"))
             .expect("Luna row");
         for _ in 0..luna {
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
@@ -6678,7 +6801,7 @@ fn picker_enter_on_effort_row_carries_model_and_effort() {
                     model: Some(m),
                     effort: Some(e),
                     ..
-                }] if m == "gpt-5.6-luna" && e == "minimal"
+                }] if m == "gpt-future-luna" && e == "future-effort"
             ),
             "one create, and no Claude refill behind a Codex launch: {out:?}"
         );
@@ -6765,7 +6888,7 @@ fn picker_second_row_creates_codex_agent() {
         let mut out = Vec::new();
 
         open_picker(&mut app);
-        for code in [KeyCode::Char('j'), KeyCode::Enter] {
+        for code in [KeyCode::Down, KeyCode::Enter] {
             handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
         }
         assert!(
@@ -6793,7 +6916,7 @@ fn picker_third_row_creates_cursor_agent() {
         let mut out = Vec::new();
 
         open_picker(&mut app);
-        for code in [KeyCode::Char('j'), KeyCode::Char('j'), KeyCode::Enter] {
+        for code in [KeyCode::Down, KeyCode::Down, KeyCode::Enter] {
             handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
         }
         assert!(
@@ -7077,7 +7200,7 @@ fn picker_omits_a_disabled_harness() {
         );
 
         // The second row is now Cursor: the rows shift, nothing is dead.
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
             app.modals.overlay.is_none(),
@@ -16204,7 +16327,7 @@ fn seed_background_run(app: &mut App) {
 
 /// Route the preset store at a temp file (and the config at a default
 /// one) and pre-seed two presets: "reviewer" (claude · opus · high,
-/// wrapped) then "scratch" (codex · gpt-5.5, bare).
+/// wrapped) then "scratch" (codex · gpt-future-luna, bare).
 pub(super) fn with_seeded_presets(f: impl FnOnce()) {
     use crate::agent_presets::AgentPreset;
     let dir = tempfile::tempdir().unwrap();
@@ -16226,7 +16349,7 @@ pub(super) fn with_seeded_presets(f: impl FnOnce()) {
                     name: "scratch".into(),
                     kind: AgentKind::Codex,
                     custom_harness: None,
-                    model: Some("gpt-5.5".into()),
+                    model: Some("gpt-future-luna".into()),
                     effort: None,
                     prefix: String::new(),
                     postfix: String::new(),
@@ -17365,8 +17488,8 @@ fn presets_a_fills_the_editor_and_enter_persists() {
         };
         assert_eq!(editor.name.as_str(), "tested");
         assert_eq!(editor.kind, AgentKind::Codex);
-        assert_eq!(editor.model, "gpt-5.6-sol", "→ steps off the default");
-        assert_eq!(editor.effort, "minimal");
+        assert_eq!(editor.model, "gpt-future-sol", "→ steps off the default");
+        assert_eq!(editor.effort, "future-effort");
         assert_eq!(editor.prefix.as_str(), "Line one\nLine two\n\nLine four");
         assert_eq!(editor.field, PresetField::Postfix);
 
@@ -17393,8 +17516,8 @@ fn presets_a_fills_the_editor_and_enter_persists() {
         let saved = &crate::agent_presets::load()[2];
         assert_eq!(saved.name, "tested");
         assert_eq!(saved.kind, AgentKind::Codex);
-        assert_eq!(saved.model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(saved.effort.as_deref(), Some("minimal"));
+        assert_eq!(saved.model.as_deref(), Some("gpt-future-sol"));
+        assert_eq!(saved.effort.as_deref(), Some("future-effort"));
         assert_eq!(saved.prefix, "Line one\nLine two\n\nLine four");
         assert_eq!(saved.postfix, "END");
         assert!(
@@ -17679,7 +17802,7 @@ fn presets_e_edits_in_place() {
         assert_eq!(editor.editing, Some(1));
         assert_eq!(editor.name.as_str(), "scratch");
         assert_eq!(editor.kind, AgentKind::Codex);
-        assert_eq!(editor.model, "gpt-5.5");
+        assert_eq!(editor.model, "gpt-future-luna");
         assert_eq!(editor.effort, crate::config::DEFAULT_CHOICE);
 
         // Tab to Model; the last choice wraps to the default.
@@ -18114,6 +18237,233 @@ pub(super) fn worktree_branches(app: &App) -> Vec<String> {
         .iter()
         .map(|w| w.branch.clone())
         .collect()
+}
+
+/// The PROJECT TAB's ACCOUNT rows: one per harness with an account switch,
+/// under the typed rows, reading `global` until the project picks. Enter
+/// lists every folder by its full path — the CLI's own and its siblings,
+/// never a file beside them — and a pick lands in the selected project's
+/// entry only, the row reading the folder's name back; Esc on the list
+/// keeps the old pick and puts the overlay back on the row; ←/→ step
+/// through the same list; **+ add folder…** types one in, which joins the
+/// list for good and is picked, and a name two folders share reads with
+/// its parent.
+#[test]
+fn the_project_tab_picks_an_account_folder_from_a_list() {
+    use nebula_core::{Entity, Project, ProjectId};
+    let draw_to_string = |app: &mut App| {
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        buffer_text(&terminal)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    for name in [".claude", ".claude-work", ".claude-work2"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    std::fs::write(root.join(".claude.json"), "{}").unwrap();
+    let shown = |name: &str| root.join(name).display().to_string();
+    let path = root.join("config.json");
+    // The pickers look beside these folders instead of the real home.
+    std::fs::write(
+        &path,
+        serde_json::json!({ "harnesses": {
+            "claude": { "account_home": shown(".claude") },
+            "codex": { "account_home": shown(".codex") },
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let saved = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    crate::config::with_config_path(path.clone(), || {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    id: ProjectId("p2".into()),
+                    name: "other".into(),
+                    repo_path: "/tmp/other".into(),
+                    sort_order: 1,
+                }),
+            },
+        );
+        app.nav.sel_project = 0;
+        let tab = crate::config::project_tab();
+        let row = crate::config::tab_settings(tab).len();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
+        press(&mut app, KeyCode::Char(digit), KeyModifiers::NONE, &mut out);
+        for _ in 0..crate::config::tab_len(tab) {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        for _ in 0..=row {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(settings_view(&app).selected, row);
+        let screen = draw_to_string(&mut app);
+        assert!(screen.contains("Claude account"), "{screen}");
+        assert!(screen.contains("Codex account"), "{screen}");
+        assert!(screen.contains("[global]"), "{screen}");
+
+        // Enter: the folders by full path, the file beside them left out.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let labels = |app: &App| -> Vec<String> {
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("expected the account picker, got {:?}", app.modals.overlay);
+            };
+            menu.items.iter().map(|i| i.label.clone()).collect()
+        };
+        assert_eq!(
+            labels(&app),
+            [
+                "global (Settings → Agents)  ✓".to_string(),
+                shown(".claude"),
+                shown(".claude-work"),
+                shown(".claude-work2"),
+                "+ add folder…".to_string(),
+            ]
+        );
+        // Esc: nothing picked, the overlay back on the row.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(settings_view(&app).selected, row);
+        assert!(saved(&path).get("projects").is_none());
+
+        // Pick `.claude-work2`: the selected project's entry, and only it.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "a pick is a file write, not a request");
+        assert_eq!(
+            saved(&path)["projects"],
+            serde_json::json!({ "/tmp/demo": { "accounts": { "claude": shown(".claude-work2") } } })
+        );
+        assert_eq!(settings_view(&app).selected, row);
+        let screen = draw_to_string(&mut app);
+        assert!(screen.contains("[.claude-work2]"), "{screen}");
+
+        // ←: one step back through the same list.
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            saved(&path)["projects"]["/tmp/demo"]["accounts"]["claude"],
+            serde_json::json!(shown(".claude-work"))
+        );
+
+        // The list opens on the current pick, ticked.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+            panic!("expected the account picker");
+        };
+        assert_eq!(
+            menu.items[menu.hover].label,
+            format!("{}  ✓", shown(".claude-work"))
+        );
+        // + add folder…: one somewhere else, sharing a name with a found one.
+        let last = menu.items.len() - 1;
+        for _ in menu.hover..last {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+            panic!("expected the folder prompt, got {:?}", app.modals.overlay);
+        };
+        assert_eq!(prompt.title, "Claude account folder · demo");
+        let elsewhere = shown("elsewhere/.claude-work");
+        type_text(&mut app, &elsewhere, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let file = saved(&path);
+        assert_eq!(
+            file["account_folders"],
+            serde_json::json!({ "claude": [elsewhere] })
+        );
+        assert_eq!(
+            file["projects"]["/tmp/demo"]["accounts"]["claude"],
+            serde_json::json!(elsewhere)
+        );
+        assert_eq!(settings_view(&app).selected, row);
+        let screen = draw_to_string(&mut app);
+        assert!(screen.contains("[elsewhere/.claude-work]"), "{screen}");
+
+        // Back to global drops the pick, and with it the project's entry.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(saved(&path)["projects"], serde_json::json!({}));
+    });
+}
+
+/// The Agents tab's **Account** row is the global pick: Enter lists the
+/// same folders with `default` first, a pick lands in the harness's own
+/// `harnesses` entry, and `default` takes it out again.
+#[test]
+fn the_agents_tab_account_row_picks_the_global_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    for name in [".claude", ".claude-work"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    let shown = |name: &str| root.join(name).display().to_string();
+    let path = root.join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({ "harnesses": { "claude": { "account_home": shown(".claude") } } })
+            .to_string(),
+    )
+    .unwrap();
+    let saved = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    crate::config::with_config_path(path.clone(), || {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        let (tab, row) =
+            crate::config::locate_agent("claude", crate::config::HarnessField::Account).unwrap();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
+        press(&mut app, KeyCode::Char(digit), KeyModifiers::NONE, &mut out);
+        for _ in 0..crate::config::tab_len(tab) {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        for _ in 0..=row {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(settings_view(&app).selected, row);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+            panic!("expected the account picker, got {:?}", app.modals.overlay);
+        };
+        assert_eq!(
+            menu.title.as_deref(),
+            Some("Claude account · every project")
+        );
+        assert_eq!(menu.items[0].label, "default (the CLI's own)  ✓");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            saved(&path)["harnesses"]["claude"],
+            serde_json::json!({ "account_home": shown(".claude"), "account_dir": shown(".claude-work") })
+        );
+        // default: the key goes, the rest of the entry stays.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            saved(&path)["harnesses"]["claude"],
+            serde_json::json!({ "account_home": shown(".claude") })
+        );
+    });
 }
 
 /// **Run command** on the PROJECT TAB: Enter opens a prompt titled with
@@ -18559,8 +18909,9 @@ fn the_harness_picker_is_no_wider_than_its_rows_and_keeps_its_keys_in_the_footer
         };
         let (on_claude, text) = drawn(&mut app);
         let (title_w, rows_w) = match &app.modals.overlay {
+            // The title wears the type-ahead's bare ` ⌕`.
             Some(Overlay::Menu(m)) => (
-                m.title.as_deref().unwrap().chars().count() + 4,
+                m.title.as_deref().unwrap().chars().count() + 6,
                 m.items
                     .iter()
                     .map(|i| i.label.chars().count())
@@ -18584,7 +18935,7 @@ fn the_harness_picker_is_no_wider_than_its_rows_and_keeps_its_keys_in_the_footer
         );
         let footer = lines
             .iter()
-            .position(|l| l.contains("Tab: cloud off") && l.contains("s/?: settings"))
+            .position(|l| l.contains("Tab: cloud off") && l.contains("?: settings"))
             .unwrap_or_else(|| panic!("the footer names the picker's keys:\n{text}"));
         assert!(footer > bottom, "below the modal, in the footer bar");
 
@@ -18593,7 +18944,7 @@ fn the_harness_picker_is_no_wider_than_its_rows_and_keeps_its_keys_in_the_footer
         let (on_codex, text) = drawn(&mut app);
         assert_eq!(on_codex, on_claude, "hovering another row never resizes it");
         assert!(!text.contains("Tab: cloud"), "{text}");
-        assert!(text.contains("s/?: settings"), "{text}");
+        assert!(text.contains("?: settings"), "{text}");
     })
 }
 
@@ -19543,6 +19894,92 @@ fn cursor_preset_effort_follows_the_model_family() {
             "spec label names family and effort:\n{text}"
         );
     });
+}
+
+/// The harness picker itself takes type-ahead (#117): a few letters
+/// pick a harness out of a long list instead of scrolling to it.
+#[test]
+fn picker_types_to_filter_harnesses() {
+    with_default_config(|| {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.nav.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        fn menu(app: &App) -> &ContextMenu {
+            match &app.modals.overlay {
+                Some(Overlay::Menu(menu)) => menu,
+                other => panic!("expected the picker, got {other:?}"),
+            }
+        }
+
+        open_picker(&mut app);
+        let all = menu(&app).items.len();
+        assert!(menu(&app).filter.is_some(), "the picker takes type-ahead");
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("New session ⌕"),
+            "bare ⌕ in the title:\n{text}"
+        );
+        assert!(text.contains("type to filter"), "footer hint:\n{text}");
+        assert!(
+            text.contains("Esc: close"),
+            "Esc closes the picker:\n{text}"
+        );
+
+        // "gro" narrows to Grok Build, the cursor on it.
+        type_text(&mut app, "gro", &mut out);
+        assert_eq!(labels_of(menu(&app)), vec!["Grok Build"]);
+        assert_eq!(menu(&app).hover, 0);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("New session ⌕ gro"),
+            "query in the title:\n{text}"
+        );
+
+        // A letter no harness matches is refused and flashed.
+        type_text(&mut app, "z", &mut out);
+        assert_eq!(menu(&app).filter_query(), "gro");
+        assert!(app
+            .chrome
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("groz")));
+
+        // Backspace widens back to every row, the cursor kept on the
+        // harness it was on rather than thrown to the top.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(menu(&app).items.len(), all);
+        assert_eq!(menu(&app).items[menu(&app).hover].label, "Grok Build");
+
+        // Esc with nothing typed closes; Esc with text clears it first.
+        type_text(&mut app, "cod", &mut out);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(menu(&app).filter_query(), "");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.modals.overlay.is_none());
+
+        // Enter on a match launches it.
+        open_picker(&mut app);
+        type_text(&mut app, "codex", &mut out);
+        assert_eq!(menu(&app).items[menu(&app).hover].label, "Codex");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::CreateAgent {
+                kind: AgentKind::Codex,
+                ..
+            })
+        ));
+    });
+}
+
+fn labels_of(menu: &ContextMenu) -> Vec<&str> {
+    menu.items.iter().map(|i| i.label.as_str()).collect()
 }
 
 #[test]
@@ -20681,13 +21118,9 @@ fn a_click_on_a_list_row_is_enter_on_it() {
                 // Drawn, as the clicked one is: the pane's size rides
                 // every Attach.
                 drawn_list_area(&mut by_keys);
-                // Letters type ahead in the palette and the preset
-                // lists, so ↓ moves there.
-                let down = if name == "palette" || name.ends_with("presets") {
-                    KeyCode::Down
-                } else {
-                    KeyCode::Char('j')
-                };
+                // Letters type ahead in every one of these lists, so
+                // ↓ moves.
+                let down = KeyCode::Down;
                 // The palette opens with its cursor on the top
                 // session, under the project header drawn above it:
                 // walk up to the first row before counting down.
@@ -22350,9 +22783,7 @@ fn a_worktree_delete_waits_for_its_check_and_lists_what_it_found() {
         let mut out = Vec::new();
         crate::delete_check::sync(&mut app, &mut out);
         assert!(out.is_empty(), "asked once per confirm: {out:?}");
-        // A check that has not answered within SHOW_AFTER: the dialog
-        // shows with "Checking…".
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
+        // The dialog shows its pending check immediately.
         assert!(confirm_screen(&mut app).contains("Checking 'feat' for work in progress"));
 
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
@@ -22403,21 +22834,15 @@ fn a_worktree_delete_waits_for_its_check_and_lists_what_it_found() {
     });
 }
 
-/// A check that answers within SHOW_AFTER opens the dialog once, already
-/// filled in: until the answer nothing is drawn but a footer line, and
-/// once shown its text does not change — the first frame is the last
-/// word, not a "Checking…" body that grows into another dialog.
+/// Opening the dialog never waits for a daemon round trip. Findings land
+/// in the already visible confirmation, while Enter remains gated.
 #[test]
-fn a_fast_check_opens_the_dialog_once_and_filled_in() {
+fn a_worktree_delete_dialog_opens_immediately_while_checking() {
     with_default_config(|| {
         let (mut app, req_id) = delete_feat_with_check();
-        let held = confirm_screen(&mut app);
-        assert!(!held.contains("from disk?"), "no dialog yet:\n{held}");
-        assert!(
-            held.contains("checking 'feat' for work in progress"),
-            "{held}"
-        );
-
+        let screen = confirm_screen(&mut app);
+        assert!(screen.contains("from disk?"), "{screen}");
+        assert!(screen.contains("Checking 'feat'"), "{screen}");
         hse(
             &mut app,
             ServerEvent::WorktreeChecked {
@@ -22429,47 +22854,17 @@ fn a_fast_check_opens_the_dialog_once_and_filled_in() {
                 },
             },
         );
-        let shown = confirm_screen(&mut app);
-        assert!(
-            shown.contains("from disk?") && shown.contains("2 uncommitted changes"),
-            "{shown}"
-        );
-        assert!(
-            !shown.contains("checking 'feat'"),
-            "the footer line is down"
-        );
-        assert!(!shown.contains("Checking 'feat'"), "{shown}");
-        assert_eq!(app.chrome.flash, None);
-        assert_eq!(confirm_screen(&mut app), shown, "the same dialog");
-    });
-}
-
-/// A check that has not answered by SHOW_AFTER: the event loop wakes then,
-/// and the dialog shows with "Checking…" so the user sees why Enter waits.
-#[test]
-fn a_slow_check_reveals_the_dialog_at_show_after() {
-    with_default_config(|| {
-        let (mut app, _) = delete_feat_with_check();
-        let reveal = crate::delete_check::reveal_at(&app).expect("held");
-        let wait = reveal.saturating_duration_since(std::time::Instant::now());
-        assert!(
-            wait > crate::delete_check::SHOW_AFTER - std::time::Duration::from_secs(1),
-            "{wait:?}"
-        );
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
-        assert!(crate::delete_check::reveal_at(&app).is_none());
         let screen = confirm_screen(&mut app);
         assert!(
-            screen.contains("from disk?") && screen.contains("Checking 'feat'"),
+            screen.contains("from disk?") && screen.contains("2 uncommitted changes"),
             "{screen}"
         );
+        assert!(!screen.contains("Checking 'feat'"), "{screen}");
+        assert_eq!(app.chrome.flash, None);
     });
 }
 
-/// While the check is out the dialog chooses nothing: held unshown, only a
-/// cancel gets through (Enter waits, saying so); shown with "Checking…",
-/// Enter and `y` still wait for the answer. Esc cancels throughout, and
-/// takes the footer line down with it.
+/// Enter and `y` wait for the check; Esc cancels immediately.
 #[test]
 fn a_confirm_waiting_on_its_check_chooses_nothing_but_cancel() {
     with_default_config(|| {
@@ -22482,7 +22877,6 @@ fn a_confirm_waiting_on_its_check_chooses_nothing_but_cancel() {
         assert!(out.is_empty(), "{out:?}");
         assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
 
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
         press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(out.is_empty(), "{out:?}");
@@ -22554,7 +22948,6 @@ fn reopening_a_worktree_delete_checks_again() {
             [ClientRequest::CheckWorktree { req_id, .. }] => assert_ne!(*req_id, first),
             other => panic!("asked again: {other:?}"),
         }
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
         assert!(confirm_screen(&mut app).contains("Checking 'feat'"));
     });
 }
@@ -22582,9 +22975,8 @@ fn an_older_daemon_gets_no_check_and_the_old_confirm() {
 }
 
 /// The card's own delete that offers to take the emptied worktree too is
-/// checked the same way; once shown, its "no, the card only" never waits,
-/// since it deletes no checkout — but nothing is chosen in a dialog still
-/// held unshown for its check.
+/// checked the same way; its "no, the card only" never waits, since it
+/// deletes no checkout.
 #[test]
 fn a_card_delete_that_offers_the_worktree_checks_it_but_n_never_waits() {
     with_default_config(|| {
@@ -22606,10 +22998,6 @@ fn a_card_delete_that_offers_the_worktree_checks_it_but_n_never_waits() {
             "{out:?}"
         );
         out.clear();
-        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-        assert!(out.is_empty(), "not chosen unseen: {out:?}");
-        assert!(matches!(app.modals.overlay, Some(Overlay::Confirm(_))));
-        crate::delete_check::age_checks(&mut app, crate::delete_check::SHOW_AFTER);
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(out.is_empty(), "yes-to-both waits for the check: {out:?}");
         press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
@@ -22672,4 +23060,172 @@ fn a_held_attach_goes_out_after_a_frame_with_no_pane() {
         ),
         "{out:?}"
     );
+}
+
+/// A PR made in another repo must still link and turn the finished row
+/// purple. Even coincidentally matching branch/SHA cannot authorize cleanup.
+#[test]
+fn reported_pr_links_refreshes_turns_purple_and_never_cleans_the_checkout() {
+    use nebula_core::{Entity, Link, WorktreeId};
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let id = WorktreeId("w1".into());
+    app.github.pr_recheck.insert(
+        id.clone(),
+        (
+            std::time::Instant::now() + std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(300),
+        ),
+    );
+    let url = "https://github.com/other/game/pull/384";
+    hse(
+        &mut app,
+        ServerEvent::EntityUpserted {
+            entity: Entity::Link(Link {
+                id: LinkId("reported".into()),
+                worktree_id: id.clone(),
+                url: url.into(),
+                sort_order: 0,
+            }),
+        },
+    );
+    assert!(
+        !app.github.pr_recheck.contains_key(&id),
+        "new links bypass old no-PR backoff"
+    );
+    assert_eq!(reported_pr_for(&app, &id).as_deref(), Some(url));
+    let mut pr = cached_pr(384);
+    pr.reported = true;
+    pr.url = url.into();
+    pr.head = app.tree.worktrees[0].branch.clone();
+    pr.head_sha = "0123456789abcdef".into();
+    land_pull_request(&mut app, id.clone(), Lookup::Found(pr.clone()));
+    assert_eq!(
+        app.visible_links().len(),
+        1,
+        "saved and resolved link are one row"
+    );
+    assert!(!app.worktree_wears_merge(&id));
+    pr.state = crate::pull_request::STATE_MERGED.into();
+    land_pull_request(&mut app, id.clone(), Lookup::Found(pr));
+    assert!(app.worktree_wears_merge(&id));
+    assert!(app.merge_is_fresh(&id));
+    app.launcher.auto_cleanup_merged = true;
+    app.tree.worktrees[0].is_main = false;
+    let mut out = Vec::new();
+    maybe_auto_cleanup_merged(&mut app, &id, &mut out);
+    assert!(
+        out.is_empty(),
+        "reported PRs never request destructive cleanup"
+    );
+    let json = serde_json::to_string(app.github.pull_requests[&id].as_ref().unwrap()).unwrap();
+    let restored: crate::pull_request::PullRequest = serde_json::from_str(&json).unwrap();
+    assert!(restored.reported, "cache must preserve cleanup protection");
+}
+
+#[test]
+fn a_delete_check_timeout_repaints_an_idle_dialog_once() {
+    with_default_config(|| {
+        let (mut app, _) = delete_feat_with_check();
+        assert!(crate::delete_check::timeout_at(&app).is_some());
+        crate::delete_check::age_checks(&mut app, crate::delete_check::CHECK_PATIENCE);
+        assert!(crate::delete_check::timeout_at(&app).is_none());
+        assert!(confirm_screen(&mut app).contains("taking too long"));
+    });
+}
+
+/// Switching to the least recently used screen must claim it before
+/// inserting the pane we leave into an already full cache.
+#[test]
+fn opening_the_oldest_cached_session_preserves_its_screen() {
+    let mut app = App::new();
+    seed_tree(&mut app);
+    let mut out = Vec::new();
+    for n in 1..=crate::app::TERM_CACHE_MAX + 1 {
+        let id = format!("a{n}");
+        if n > 1 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: agent_entity(&id, "w1", &id, false),
+                },
+            );
+        }
+        let session = SessionRef::Agent(AgentId(id));
+        attach_now(&mut app, session.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session,
+                base_seq: 0,
+                data: b"cached screen".to_vec(),
+            },
+        );
+    }
+    assert_eq!(app.pane.term_cache.len(), crate::app::TERM_CACHE_MAX);
+    out.clear();
+    attach_now(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+    let term = app.pane.term.as_ref().unwrap();
+    assert!(term.painted, "screen appears before the daemon replies");
+    assert!(term.parser.screen().contents().contains("cached screen"));
+    assert!(out.iter().any(|r| matches!(
+        r,
+        ClientRequest::Attach {
+            from_seq: Some(13),
+            ..
+        }
+    )));
+}
+
+/// Headless CPU-cost probe for a busy project; excludes daemon and terminal I/O.
+#[test]
+#[ignore = "manual scaling benchmark; run with --ignored --nocapture"]
+fn performance_probe_many_sessions_draw() {
+    with_default_config(|| {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let template_worktree = app.tree.worktrees[0].clone();
+        let template_agent = app.tree.agents[0].clone();
+        for w in 0..50 {
+            let mut worktree = template_worktree.clone();
+            worktree.id = WorktreeId(format!("scale-w{w}"));
+            worktree.is_main = false;
+            worktree.branch = format!("feature-{w}");
+            for a in 0..40 {
+                let mut agent = template_agent.clone();
+                agent.id = AgentId(format!("scale-a{w}-{a}"));
+                agent.name = format!("Agent {w}/{a}");
+                agent.worktree_id = worktree.id.clone();
+                app.tree.agents.push(agent);
+            }
+            app.tree.worktrees.push(worktree);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(190, 50)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..50 {
+            let began = std::time::Instant::now();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            samples.push(began.elapsed());
+        }
+        samples.sort();
+        eprintln!(
+            "2001 sessions / 51 worktrees: median {:.3} ms/frame, max {:.3} ms/frame",
+            samples[25].as_secs_f64() * 1000.0,
+            samples[49].as_secs_f64() * 1000.0
+        );
+        let began = std::time::Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(crate::palette::Palette::new(
+                &app.tree,
+                false,
+                &app.github.open_prs,
+                false,
+            ));
+        }
+        eprintln!(
+            "2001-session palette: {:.3} ms/open",
+            began.elapsed().as_secs_f64() * 50.0
+        );
+    });
 }

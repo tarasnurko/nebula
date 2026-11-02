@@ -51,14 +51,15 @@ pub struct Config {
     pub harnesses: BTreeMap<String, nebula_core::harness::HarnessOverride>,
     /// PROJECT SETTINGS: one entry per project set up differently from the
     /// rest, keyed by the project's repo path as the store holds it. The
-    /// TUI's Project tab owns the map; the daemon reads the one key in it
-    /// that is its to act on, through [`Config::run_command`].
+    /// TUI's Project tab owns the map; the daemon reads the keys in it
+    /// that are its to act on, through [`Config::run_command`] and
+    /// [`Config::project_account`].
     pub projects: BTreeMap<PathBuf, ProjectConfig>,
 }
 
 /// One project's entry under `projects` — the rows of the TUI's Project
-/// tab, of which the daemon reads one. The rest (`open_command`) are the
-/// TUI's and pass through unread.
+/// tab, of which the daemon reads the run command and the accounts. The
+/// rest (`open_command`) are the TUI's and pass through unread.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ProjectConfig {
@@ -66,6 +67,11 @@ pub struct ProjectConfig {
     /// worktrees, typed into Settings → Project. Empty means the checkout's `.nebula.json`
     /// `run`, as before the row existed.
     pub run_command: String,
+    /// The ACCOUNT folder each harness's new sessions in this project start
+    /// on, by harness id (`{"claude": "~/.claude-work2"}`), picked in
+    /// Settings → Project. A harness it doesn't name starts on its global
+    /// account (Settings → Agents).
+    pub accounts: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -125,6 +131,18 @@ impl Config {
             .get(repo_path)
             .map(|p| p.run_command.trim())
             .filter(|c| !c.is_empty())
+    }
+
+    /// The ACCOUNT folder the project checked out at `repo_path` picked for
+    /// `harness` in Settings → Project, as typed (`~/.claude-work2`); None
+    /// when it picked none, which means the harness's global account.
+    pub fn project_account(&self, repo_path: &Path, harness: &str) -> Option<&str> {
+        self.projects
+            .get(repo_path)?
+            .accounts
+            .get(harness)
+            .map(|dir| dir.trim())
+            .filter(|dir| !dir.is_empty())
     }
 }
 
@@ -253,6 +271,24 @@ mod tests {
     /// The Project tab's `run_command`, under the project's repo path:
     /// trimmed, blank is unset, and the entry's other rows — the TUI's —
     /// don't stop the daemon reading it.
+    #[test]
+    fn project_accounts_are_read_per_project_and_harness() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"projects": {
+                "/tmp/demo": { "run_command": "x", "accounts": { "claude": " ~/.claude-work2 ", "codex": "  " } }
+            }}"#,
+        )
+        .unwrap();
+        let demo = Path::new("/tmp/demo");
+        assert_eq!(cfg.project_account(demo, "claude"), Some("~/.claude-work2"));
+        // Blank is "global", and so is a harness or project it doesn't name.
+        assert_eq!(cfg.project_account(demo, "codex"), None);
+        assert_eq!(cfg.project_account(demo, "cursor"), None);
+        assert_eq!(cfg.project_account(Path::new("/tmp/other"), "claude"), None);
+        // The run command still reads beside it.
+        assert_eq!(cfg.run_command(demo), Some("x"));
+    }
+
     #[test]
     fn run_command_is_read_per_project_and_blank_means_the_file() {
         assert_eq!(Config::default().run_command(Path::new("/tmp/demo")), None);

@@ -489,7 +489,121 @@ pub(crate) fn rekey_project_config(
     }
 }
 
+/// The ACCOUNT row at `(tab, index)`, if it is one: its harness id, and
+/// whether it is the Project tab's (the selected project's pick) rather
+/// than an Agents section's (the global one).
+fn account_row_at(tab: usize, index: usize) -> Option<(String, bool)> {
+    let cfg = crate::config::Config::load();
+    if tab == crate::config::project_tab() {
+        return cfg.project_account_row(index).map(|id| (id, true));
+    }
+    if tab == crate::config::agents_tab() {
+        if let Some((id, crate::config::HarnessField::Account)) = cfg.agent_row(index) {
+            return Some((id, false));
+        }
+    }
+    None
+}
+
+/// Enter on an ACCOUNT row: the ACCOUNT PICKER stands in for the overlay —
+/// global (a project's row) or default (the global row) first, then every
+/// folder by its full path, the current one ticked and under the cursor,
+/// then **+ add folder…**.
+pub(crate) fn open_account_picker(
+    app: &mut App,
+    harness: &str,
+    project: Option<std::path::PathBuf>,
+) {
+    let cfg = crate::config::Config::load();
+    let descriptor = cfg.effective_harness_by_id(harness);
+    let label = descriptor.display_label().to_string();
+    let current = match &project {
+        Some(path) => cfg.project(path).accounts.get(harness).cloned(),
+        None => descriptor.account.dir.clone(),
+    }
+    .and_then(|dir| nebula_core::harness::expand_account_dir(&dir));
+    let pick = |dir: Option<String>| MenuAction::PickAccount {
+        harness: harness.to_string(),
+        project: project.clone(),
+        dir,
+    };
+    let first = match &project {
+        Some(_) => format!(
+            "{} (Settings → Agents)",
+            crate::config::GLOBAL_ACCOUNT_CHOICE
+        ),
+        None => format!("{} (the CLI's own)", nebula_core::harness::DEFAULT_CHOICE),
+    };
+    let tick = |on: bool| if on { "  ✓" } else { "" };
+    let mut items = vec![MenuItem::new(
+        format!("{first}{}", tick(current.is_none())),
+        pick(None),
+    )];
+    let mut hover = 0;
+    for dir in cfg.account_choices(harness) {
+        let on = current.is_some() && nebula_core::harness::expand_account_dir(&dir) == current;
+        if on {
+            hover = items.len();
+        }
+        items.push(MenuItem::new(format!("{dir}{}", tick(on)), pick(Some(dir))));
+    }
+    items.push(MenuItem::new(
+        "+ add folder…",
+        MenuAction::AddAccountFolder {
+            harness: harness.to_string(),
+            project: project.clone(),
+        },
+    ));
+    let whose = project
+        .as_deref()
+        .and_then(|path| {
+            app.tree
+                .projects
+                .iter()
+                .find(|p| p.repo_path == path)
+                .map(|p| p.name.clone())
+        })
+        .unwrap_or_else(|| "every project".into());
+    app.modals.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some(format!("{label} account · {whose}")),
+        items,
+        at: None,
+        hover,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: None,
+    }));
+}
+
 pub(crate) fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
+    // An ACCOUNT row: Enter lists the folders, ←/→ step through them. The
+    // Project tab's is the selected project's, so it needs one.
+    if let Some((harness, on_project)) = account_row_at(tab, index) {
+        let project = if on_project {
+            let Some(path) = app.selected_project().map(|p| p.repo_path.clone()) else {
+                if let Some(view) = settings_mut(app) {
+                    view.warn("no project selected — this tab edits the one under the cursor");
+                }
+                return;
+            };
+            Some(path)
+        } else {
+            None
+        };
+        if delta == 0 {
+            open_account_picker(app, &harness, project);
+            return;
+        }
+        let mut cfg = crate::config::Config::load();
+        match &project {
+            Some(path) => cfg.cycle_project_account(path, &harness, delta),
+            None => cfg.cycle_agent_row(&harness, crate::config::HarnessField::Account, delta),
+        }
+        if save_config(app, &cfg) {
+            apply_config(app, &cfg);
+        }
+        return;
+    }
     if let Some(spec) = crate::config::setting_at(tab, index) {
         // A PROJECT TAB row edits the selected project's entry — every
         // one of them typed. With no project to edit — an empty tree —

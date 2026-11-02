@@ -25,9 +25,9 @@ pub const SWEEP_FRAME: std::time::Duration = std::time::Duration::from_millis(10
 pub const ONE_SHOT_SWEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many recently shown sessions keep their screen ([`App::term_cache`]):
-/// enough for a rotation through the sessions of a couple of worktrees.
+/// enough for a rotation through a busy project’s sessions.
 /// What bounds the memory is [`TERM_CACHE_CELLS`], not this.
-pub const TERM_CACHE_MAX: usize = 6;
+pub const TERM_CACHE_MAX: usize = 32;
 /// The most the kept screens may hold between them, in grid cells (32 bytes
 /// each, so about 12 MB — half of what two entries of that size each used to
 /// be allowed). An alt-screen CLI is a screen's worth, 200 KB; a shell whose
@@ -265,6 +265,21 @@ pub enum MenuAction {
     UnarchiveAgent(AgentId),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
+    /// ACCOUNT PICKER row: make `dir` harness `harness`'s ACCOUNT folder —
+    /// for the project at `project` (Settings → Project), or the global
+    /// one (Settings → Agents) when that is None. `dir` None puts the row
+    /// back on global (a project's) or default (the global one).
+    PickAccount {
+        harness: String,
+        project: Option<std::path::PathBuf>,
+        dir: Option<String>,
+    },
+    /// The ACCOUNT PICKER's last row, **+ add folder…**: type a folder it
+    /// doesn't list.
+    AddAccountFolder {
+        harness: String,
+        project: Option<std::path::PathBuf>,
+    },
     /// Picker result: create an agent of this kind (chains into the NEW
     /// SESSION box — a PR SESSION into its name prompt). `model`/`effort`
     /// are submenu choices: None means the row
@@ -463,8 +478,9 @@ pub struct ContextMenu {
     pub area: Rect,
     /// The menu ← returns to when this one is a submenu.
     pub parent: Option<Box<ContextMenu>>,
-    /// Type-ahead over the rows — set on the MODEL / EFFORT submenus, where
-    /// letters filter instead of moving (↑/↓ move there); None elsewhere.
+    /// Type-ahead over the rows — set on the harness pickers and their
+    /// MODEL / EFFORT submenus (and a few other pickers), where letters
+    /// filter instead of moving (↑/↓ move there); None elsewhere.
     pub filter: Option<MenuFilter>,
 }
 
@@ -477,6 +493,14 @@ pub struct MenuFilter {
 }
 
 impl ContextMenu {
+    /// Whether this is an ACCOUNT PICKER (Enter on a settings account row),
+    /// which stands in for the settings overlay until a row or Esc.
+    pub fn is_account_picker(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item.action, MenuAction::PickAccount { .. }))
+    }
+
     /// Narrow the rows to `query` (fuzzy, best match first; the full list
     /// in its own order when empty, hovering the ✓ row). Returns false —
     /// and changes nothing — when no row matches, so the list never
@@ -491,10 +515,14 @@ impl ContextMenu {
             return false;
         }
         let items: Vec<MenuItem> = ranked.iter().map(|(i, _)| filter.all[*i].clone()).collect();
+        // A list with no ✓ (the harness pickers) keeps the cursor on the
+        // row it was on, so clearing a query never jumps it to the top.
+        let hovered = self.items.get(self.hover).map(|i| i.label.as_str());
         self.hover = if query.trim().is_empty() {
             items
                 .iter()
                 .position(|i| i.label.ends_with(" ✓"))
+                .or_else(|| items.iter().position(|i| Some(i.label.as_str()) == hovered))
                 .unwrap_or(0)
         } else {
             0
@@ -846,6 +874,15 @@ pub enum PromptKind {
         kind: crate::config::SettingKind,
         project: Option<std::path::PathBuf>,
     },
+    /// **+ add folder…** in an ACCOUNT PICKER: a folder to add to harness
+    /// `harness`'s pickers and pick at once — for the project at `project`,
+    /// or the global row when None. Like a typed setting's prompt it stands
+    /// in for the overlay: Enter and Esc both put it back, and an empty
+    /// answer adds nothing.
+    AccountFolder {
+        harness: String,
+        project: Option<std::path::PathBuf>,
+    },
     /// Rewrite a pinned link's URL.
     EditLink {
         id: LinkId,
@@ -1110,7 +1147,7 @@ pub struct DiffView {
     /// out per file. Its presence also turns OFF reviewed-mark persistence:
     /// marks are stored under the worktree path and pruned when that path
     /// isn't a directory, and a pull request has no path of its own.
-    pub prefetched: Option<HashMap<String, String>>,
+    pub prefetched: Option<std::sync::Arc<HashMap<String, String>>>,
     /// The pull request a prefetched view is showing, by URL — what a
     /// fresh `gh pr diff` landing later checks before replacing the
     /// contents of a modal opened on the cached copy. `None` for the
@@ -1164,8 +1201,9 @@ pub struct DiffView {
     /// The reader has moved the cursor: what lands from now on leaves it
     /// where they put it (`settle`).
     pub touched: bool,
-    /// Diffs side by side (`Ctrl+s` flips it), remembered across opens.
-    /// A narrow pane falls back to the unified diff.
+    /// Diffs side by side — the `diff_inline` SETTING off; `Ctrl+s` flips
+    /// it and writes the setting back. A narrow pane falls back to the
+    /// unified diff.
     pub split: bool,
     /// `diff` laid out side by side, while `split` is on and it has hunks.
     pub split_rows: Option<std::sync::Arc<[crate::git_diff::SplitRow]>>,
@@ -1380,6 +1418,20 @@ impl DiffView {
     pub fn toggle_split(&mut self) {
         self.split = !self.split;
         self.refresh_split();
+    }
+
+    /// The line of the new file at the top of the diff pane — or below it,
+    /// the nearest one the pane has — in the layout the last draw used:
+    /// where Enter opens the editor. 1 for a diff with no hunk.
+    pub fn editor_line(&self) -> u64 {
+        let row = self.scroll as usize;
+        let line = match &self.split_rows {
+            Some(rows) if self.split_shown => crate::git_diff::split_new_line_at(rows, row)
+                .or_else(|| crate::git_diff::split_new_line_at(rows, 0)),
+            _ => crate::git_diff::new_line_at(&self.diff, row)
+                .or_else(|| crate::git_diff::new_line_at(&self.diff, 0)),
+        };
+        line.map_or(1, u64::from)
     }
 
     /// The rows the diff pane scrolls over, in the layout the last draw
@@ -2285,9 +2337,29 @@ impl AgentLaunchDraft {
     }
 }
 
+#[derive(Clone)]
+pub struct TerminalCreation {
+    pub(crate) placeholder: TerminalId,
+    pub(crate) input: Vec<u8>,
+    pub(crate) cancelled: bool,
+}
+
+impl std::fmt::Debug for TerminalCreation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalCreation")
+            .field("placeholder", &self.placeholder)
+            .field("queued_bytes", &self.input.len())
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
+}
+
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
+    /// A temporary terminal card shown while its shell is being created.
+    /// The reply replaces its id or removes it; input waits for the real id.
+    TerminalCreated(TerminalCreation),
     /// Attach the created session; `focus` also enters and locks the
     /// terminal pane. Off (the QUICK PROMPT's default) stops at selecting
     /// the row, so the pane previews the new session without taking the
@@ -2415,6 +2487,7 @@ impl PendingIntent {
     /// on it.
     pub fn follows(&self) -> bool {
         match self {
+            PendingIntent::TerminalCreated(create) => !create.cancelled,
             PendingIntent::AttachCreated { .. }
             | PendingIntent::AttachCreatedWithCloudRetry { .. }
             | PendingIntent::AttachCreatedPrSession { .. }
@@ -2926,6 +2999,7 @@ impl vt100::Callbacks for TermCallbacks {
 
 pub struct AttachedTerm {
     pub sref: SessionRef,
+    pub(crate) replay: Option<crate::terminal_replay::Pending>,
     pub parser: vt100::Parser<TermCallbacks>,
     pub exited: bool,
     /// Size the parser (and daemon PTY) currently uses.
@@ -2943,6 +3017,8 @@ pub struct AttachedTerm {
     /// The grid is blank because the session has no screen yet — the
     /// daemon replayed an empty ring, or the session was reaped and this
     /// attach is what boots it — as opposed to a replay that hasn't landed.
+    /// It lasts until something visible lands, not the first byte: a CLI
+    /// sets its terminal modes long before a resume paints a frame.
     /// The pane's "starting session…" notice shows only in the first case:
     /// flashing it for the frame a live session's replay takes reads as a
     /// hiccup on every switch.
@@ -2975,6 +3051,7 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
+            replay: None,
             parser: vt100::Parser::new_with_callbacks(
                 rows,
                 cols,
@@ -2996,6 +3073,7 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
+        self.replay = None;
         self.parser = vt100::Parser::new_with_callbacks(
             self.rows,
             self.cols,
@@ -3026,10 +3104,18 @@ impl AttachedTerm {
             self.reset();
         }
         self.next_seq = base_seq + data.len() as u64;
+        // `reset` forgets that the pane was waiting on a boot; the replay
+        // of a session this attach is reviving doesn't end that wait.
+        let was_booting = self.booting;
         self.feed(data);
-        if !self.painted {
-            self.booting = true;
-        }
+        // Still booting while the replay leaves the grid blank: the daemon
+        // had nothing (an empty ring), or only the mode switches a CLI
+        // prints before its first frame. An agent CLI always draws
+        // something, so its blank grid is a boot whatever came before; a
+        // shell's blank grid may be a `clear`, so it counts only when the
+        // pane was already waiting.
+        self.booting = !self.shows_anything()
+            && (was_booting || !self.painted || matches!(self.sref, SessionRef::Agent(_)));
         // A replay asked for to get the history back lands the reader
         // where the scroll that asked for it was headed.
         if let Some(scroll) = self.pending_scroll.take() {
@@ -3056,16 +3142,42 @@ impl AttachedTerm {
     }
 
     fn feed(&mut self, data: &[u8]) {
+        self.parser.process(data);
         if !data.is_empty() {
             self.painted = true;
-            self.booting = false;
+            // A CLI's first bytes are mode switches (bracketed paste, focus
+            // events, a hidden cursor) and a title, seconds before a resume
+            // paints anything: booting ends with the first thing to see,
+            // not the first byte, or the pane goes black in between.
+            if self.booting && self.shows_anything() {
+                self.booting = false;
+            }
         }
-        self.parser.process(data);
+    }
+
+    /// Whether the visible grid holds anything a reader would see: a glyph,
+    /// or a cell painted with a background or in reverse video. Spaces a
+    /// program writes to clear lines don't count.
+    pub fn shows_anything(&self) -> bool {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        (0..rows).any(|row| {
+            (0..cols).any(|col| {
+                screen.cell(row, col).is_some_and(|cell| {
+                    cell.contents().chars().any(|c| !c.is_whitespace())
+                        || cell.bgcolor() != vt100::Color::Default
+                        || cell.inverse()
+                })
+            })
+        })
     }
 
     /// Regrid to `cols`×`rows` when that differs from the current size.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if (self.cols, self.rows) != (cols, rows) {
+            if let Some(replay) = &mut self.replay {
+                replay.resize(cols, rows);
+            }
             self.cols = cols;
             self.rows = rows;
             self.parser.screen_mut().set_size(rows, cols);
@@ -3110,6 +3222,10 @@ impl AttachedTerm {
     /// parser's offset climbed past the top forever, and the way back down
     /// took as many notches as were spent up there.
     pub fn set_scroll(&mut self, scroll: usize) {
+        if self.replay.is_some() {
+            self.pending_scroll = Some(scroll);
+            return;
+        }
         self.parser.screen_mut().set_scrollback(scroll);
     }
 
@@ -3143,9 +3259,11 @@ pub struct UiState {
     /// in older blobs, which keep the flat list.
     #[serde(default)]
     pub diff_tree: bool,
-    /// False means the diff modal opens side by side; absent in older blobs,
-    /// so they keep the new default.
-    #[serde(default)]
+    /// RETIRED to the `diff_inline` SETTING: blobs through this build said
+    /// here that `Ctrl+s` had left the diff modal unified. Read once, to
+    /// carry that choice into the setting (`restore_ui_state`), and never
+    /// written again.
+    #[serde(default, skip_serializing)]
     pub diff_unified: bool,
     /// Height the LAUNCHER VIEW's pane was dragged to; absent in older
     /// blobs, and None in ones written before the edge was ever dragged,
@@ -3998,9 +4116,6 @@ pub struct ModalState {
     /// The diff modal lists its files as a directory tree (`Ctrl+t` inside
     /// it), remembered across opens and launches like the width.
     pub diff_tree: bool,
-    /// The diff modal shows diffs side by side (`Ctrl+s` inside it),
-    /// remembered the same way.
-    pub diff_split: bool,
     /// Selected tab of the settings modal, remembered across opens.
     pub settings_tab: usize,
     /// Cursor row of the settings modal, one per tab, remembered across
@@ -4042,7 +4157,6 @@ impl Default for ModalState {
             follow_up: None,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             diff_tree: false,
-            diff_split: true,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
             settings_on_tabs: true,
@@ -5027,7 +5141,7 @@ impl App {
     pub fn is_placeholder_session(&self, sref: &SessionRef) -> bool {
         match sref {
             SessionRef::Agent(id) => self.is_placeholder_agent(id),
-            SessionRef::Terminal(_) => false,
+            SessionRef::Terminal(id) => self.requests.pending.values().any(|intent| matches!(intent, PendingIntent::TerminalCreated(create) if &create.placeholder == id)),
         }
     }
 
@@ -5194,6 +5308,35 @@ impl App {
     /// never lags a j/k by a poll interval.
     pub fn git_changes_stale(&self) -> bool {
         self.jobs.git_changes.as_ref().map(|(id, _)| id) != self.selected_worktree().map(|w| &w.id)
+    }
+
+    /// The pane is waiting on a session's first frame: the "starting
+    /// session…" notice is up, and its spinner wants frames.
+    pub fn pane_booting(&self) -> bool {
+        self.pane
+            .term
+            .as_ref()
+            .is_some_and(|t| t.booting && !t.exited && t.refused.is_none() && t.replay.is_none())
+    }
+
+    /// The booting notice's spinner is turning, so the loop owes it frames:
+    /// nothing else repaints a pane waiting on a CLI that has yet to draw.
+    pub fn boot_spinner_active(&self) -> bool {
+        self.chrome.animations && self.pane_booting()
+    }
+
+    /// The pane's booting session is an agent picking a conversation back
+    /// up (it has a stored session id to resume) rather than starting one.
+    pub fn pane_resuming(&self) -> bool {
+        let Some(SessionRef::Agent(id)) = self.pane.term.as_ref().map(|t| &t.sref) else {
+            return false;
+        };
+        self.tree.agents.iter().any(|a| {
+            &a.id == id
+                && a.session_id
+                    .as_deref()
+                    .is_some_and(|sid| !sid.trim().is_empty())
+        })
     }
 
     /// Whether the daemon currently holds a live PTY for `sref`. Attaching
@@ -6256,6 +6399,64 @@ mod tests {
         assert_eq!(term.next_seq, 2);
     }
 
+    /// What Claude prints before its first frame: a cursor save/restore,
+    /// a hidden cursor, bracketed paste, focus events. A resume can sit
+    /// there for seconds loading the transcript, and the pane must go on
+    /// saying it is booting rather than turn into a blank black grid.
+    const CLI_PREAMBLE: &[u8] = b"\x1b7\x1b[r\x1b8\x1b[?25h\x1b[?25l\x1b[?2004h\x1b[?2031h\x1b[?1004h\x1b]0;Claude Code\x07";
+
+    #[test]
+    fn mode_switches_before_the_first_frame_keep_the_pane_booting() {
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a".into())), 20, 4);
+        term.booting = true;
+        term.apply_scrollback(0, b"");
+        let n = CLI_PREAMBLE.len() as u64;
+        term.apply_output(0, CLI_PREAMBLE);
+        assert!(
+            term.painted && term.booting,
+            "nothing to see yet: still booting"
+        );
+        // Clearing lines with spaces isn't a frame either.
+        term.apply_output(n, b"    \r\n");
+        assert!(term.booting);
+        term.apply_output(n + 6, b"\x1b[31m> \x1b[0m");
+        assert!(!term.booting, "the first visible cell ends it");
+    }
+
+    /// The attach that revives a reaped session can race the boot: the
+    /// replay already holds the preamble. That is still a boot, not a
+    /// screen.
+    #[test]
+    fn a_replay_of_only_the_preamble_is_still_booting() {
+        let mut term = AttachedTerm::new(SessionRef::Agent(AgentId("a".into())), 20, 4);
+        term.booting = true;
+        term.apply_scrollback(0, CLI_PREAMBLE);
+        assert!(term.painted && term.booting);
+
+        // A shell that cleared its screen is a screen, unless the pane was
+        // already waiting on it.
+        let mut shell = AttachedTerm::new(
+            SessionRef::Terminal(nebula_core::TerminalId("t".into())),
+            20,
+            4,
+        );
+        shell.apply_scrollback(0, b"\x1b[H\x1b[2J");
+        assert!(
+            !shell.booting,
+            "a live shell's blank screen is what it shows"
+        );
+        let mut reviving = AttachedTerm::new(
+            SessionRef::Terminal(nebula_core::TerminalId("t".into())),
+            20,
+            4,
+        );
+        reviving.booting = true;
+        reviving.apply_scrollback(0, b"\x1b[?2004h");
+        assert!(reviving.booting);
+        reviving.apply_output(8, b"$ ");
+        assert!(!reviving.booting);
+    }
+
     // ---- shared list arithmetic ----
 
     #[test]
@@ -6338,6 +6539,7 @@ mod tests {
 
     fn pr(url: &str) -> PullRequest {
         PullRequest {
+            reported: false,
             number: 7,
             url: url.into(),
             title: "Attach links".into(),

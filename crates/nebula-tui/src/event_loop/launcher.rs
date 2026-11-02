@@ -7371,6 +7371,55 @@ mod tests {
         });
     }
 
+    /// The layout is written soon after it changes, not only on `q`: a
+    /// tab opened and then the window closed comes back. Nothing is
+    /// written before the first snapshot, whose saved layout the TUI is
+    /// still waiting to restore, nor when nothing changed, and a burst of
+    /// changes is one write of the last layout.
+    #[test]
+    fn the_layout_is_saved_soon_after_it_changes() {
+        with_default_config(|| {
+            let now = tokio::time::Instant::now();
+            let mut saver = super::super::UiStateSaver::default();
+            let mut app = two_tabs();
+
+            app.chrome.snapshot_loaded = false;
+            saver.note(&app, now);
+            assert_eq!(saver.due, None, "nothing before the first snapshot");
+
+            // The snapshot lands and restores the saved layout.
+            app.launcher.launcher_tabs.reverse();
+            app.chrome.snapshot_loaded = true;
+            saver.note(&app, now);
+            assert_eq!(saver.due, None, "the restored layout is not written back");
+
+            app.launcher.launcher_tabs.reverse();
+            saver.note(&app, now);
+            let later = now + std::time::Duration::from_millis(300);
+            app.launcher.launcher_tabs.reverse();
+            app.launcher.launcher_tabs.reverse();
+            saver.note(&app, later);
+            assert_eq!(
+                saver.due,
+                Some(now + super::super::UI_STATE_SAVE_DELAY),
+                "due one delay after the first change, however many follow"
+            );
+
+            let Some(ClientRequest::SaveUiState { json }) = saver.flush(&app) else {
+                panic!("the changed layout is written");
+            };
+            let mut back = two_sessions();
+            super::super::restore_ui_state(&mut back, &json);
+            assert_eq!(
+                back.launcher.launcher_tabs,
+                [ProjectId("p2".into()), ProjectId("p1".into())]
+            );
+            assert!(saver.flush(&app).is_none(), "written once");
+            saver.note(&app, later);
+            assert_eq!(saver.due, None, "nothing left to write");
+        });
+    }
+
     /// A third project, `docs`, with a checkout and no sessions in it.
     fn seed_empty_project(app: &mut App) {
         hse(
@@ -9052,6 +9101,7 @@ mod tests {
             app.github.pull_requests.insert(
                 WorktreeId("w2".into()),
                 Some(crate::pull_request::PullRequest {
+                    reported: false,
                     number: 42,
                     url: "https://github.com/o/web/pull/42".into(),
                     title: "Polish the nav".into(),
@@ -9097,6 +9147,7 @@ mod tests {
     /// An open pull request, `#<number> Polish the nav`, on `o/demo`.
     fn pull_request(number: u64) -> crate::pull_request::PullRequest {
         crate::pull_request::PullRequest {
+            reported: false,
             number,
             url: format!("https://github.com/o/demo/pull/{number}"),
             title: "Polish the nav".into(),
@@ -11628,7 +11679,11 @@ mod tests {
             assert_eq!(buf[(root.right() - 1, root.y)].bg, fill, "edge to edge");
             assert_eq!(buf[(root.x - 1, root.y)].bg, th.accent, "the accent bar");
             let title = &buf[(root.x + 4, root.y)];
-            assert_eq!(title.fg, gray::DIM, "a fresh session's status color");
+            assert_eq!(
+                title.fg,
+                gray::dim(&app.chrome.theme),
+                "a fresh session's status color"
+            );
             assert!(title.modifier.contains(Modifier::BOLD));
             // The child is `term-1`, its title past the `└ ❯ `.
             let child_title = &buf[(child.x + 8, child.y)];
@@ -11898,8 +11953,12 @@ mod tests {
         });
     }
 
-    /// An EMPTY BAND is one line, in the title column, and `h`/`l` do
-    /// nothing to it. Tab still says there is nothing to open.
+    /// An EMPTY BAND is one line shaped like a thread's root: its scope
+    /// mark and branch in the title column, and no key hint — a project
+    /// with eight empty worktrees lists eight names, not the same sentence
+    /// eight times. The cursor's row adds its keys after the branch, and
+    /// the DETAIL STRIP says nothing runs there. `h`/`l`
+    /// do nothing to it, and Tab still says there is nothing to open.
     #[test]
     fn an_empty_worktree_is_one_line_in_the_nested_layout() {
         with_default_config(|| {
@@ -11908,8 +11967,9 @@ mod tests {
             let term = draw_tall(&mut app);
             let (head, text) = band_header(&app, &term, 2);
             assert_eq!(head.height, 1);
-            assert!(text.contains("nothing running"), "{text:?}");
-            assert!(text.contains("d: delete worktree"), "{text:?}");
+            assert!(text.starts_with("  ↳ idle "), "{text:?}");
+            assert!(!text.contains("nothing running"), "{text:?}");
+            assert!(!text.contains("delete worktree"), "{text:?}");
             let above = drawn_entries(&app, 1)[0].1;
             assert_eq!(head.y, above.bottom(), "no blank row above it");
 
@@ -11919,11 +11979,40 @@ mod tests {
                 app.selected_worktree().map(|w| w.id.0.clone()).as_deref(),
                 Some("w3")
             );
+            let term = draw_tall(&mut app);
+            let (_, text) = band_header(&app, &term, 2);
+            assert!(
+                text.contains("↳ idle  p: new session · t: terminal · d: delete worktree"),
+                "{text:?}"
+            );
+            assert!(
+                screen_text(&term).contains("agent    nothing running"),
+                "the detail strip says so too"
+            );
             key(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
             key(&mut app, KeyCode::Char('l'), KeyModifiers::NONE);
             assert!(app.launcher.launcher_folded.is_empty());
             key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
             assert_eq!(app.chrome.flash.as_deref(), Some(super::NO_SESSIONS));
+        });
+    }
+
+    /// An EMPTY BAND's open pull request stands in the PR column, where a
+    /// thread's root wears its own, and a click on it is the same click.
+    #[test]
+    fn an_empty_worktree_wears_its_pull_request_in_the_nested_layout() {
+        with_default_config(|| {
+            let mut app = with_empty_band_on_a_pull_request();
+            app.launcher.launcher_nested = true;
+            let term = draw_tall(&mut app);
+            let (head, text) = band_header(&app, &term, 2);
+            assert!(text.starts_with("  ↳ idle "), "{text:?}");
+            assert!(text.contains("#7"), "{text:?}");
+            let pr = app
+                .hit_rect(&HitTarget::LauncherThreadPr(WorktreeId("w3".into())))
+                .expect("the #7 is a link");
+            assert_eq!(pr.y, head.y);
+            assert_eq!(row_text(&term, pr), "#7");
         });
     }
 
@@ -12464,7 +12553,7 @@ mod tests {
                 .expect("the #141 is a button");
             let cell = &term.backend().buffer()[(link.x, link.y)];
             assert_eq!(cell.symbol(), "#");
-            assert_eq!(cell.fg, gray::LINK);
+            assert_eq!(cell.fg, gray::link(&app.chrome.theme));
             assert!(cell.modifier.contains(Modifier::UNDERLINED));
             assert_eq!(link.width, 4);
 
