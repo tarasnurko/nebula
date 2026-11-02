@@ -102,16 +102,27 @@ fn listing_rows(listing: &str) -> Option<Vec<Listed>> {
 /// Run the probe — `program args…` is `claude agents --json` behind the
 /// login shell — and read `session_id`'s attach id off it. `None` for every
 /// failure: no CLI, a timeout, an older Claude with no `agents` command.
-pub fn probe(program: &str, args: &[String], session_id: &str) -> Option<String> {
-    let listing = run_captured(program, args, PROBE_TIMEOUT)?;
+pub fn probe(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    session_id: &str,
+) -> Option<String> {
+    let listing = run_captured(program, args, env, PROBE_TIMEOUT)?;
     listed_background_id(&listing, session_id)
 }
 
-fn run_captured(program: &str, args: &[String], timeout: Duration) -> Option<String> {
+fn run_captured(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Option<String> {
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(program);
     command
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -252,12 +263,43 @@ mod tests {
     fn the_probe_reads_a_real_commands_stdout() {
         let script = format!("cat <<'EOF'\n{LISTING}EOF");
         let args = vec!["-c".to_string(), script];
-        assert_eq!(probe("/bin/sh", &args, SID).as_deref(), Some("1a3138b9"));
         assert_eq!(
-            probe("/bin/sh", &["-c".to_string(), "exit 3".to_string()], SID),
+            probe("/bin/sh", &args, &[], SID).as_deref(),
+            Some("1a3138b9")
+        );
+        assert_eq!(
+            probe(
+                "/bin/sh",
+                &["-c".to_string(), "exit 3".to_string()],
+                &[],
+                SID
+            ),
             None
         );
-        assert_eq!(probe("/nebula-test/no-such-shell", &[], SID), None);
+        assert_eq!(probe("/nebula-test/no-such-shell", &[], &[], SID), None);
+    }
+
+    /// The listing is asked of the session's own ACCOUNT: a session on
+    /// `~/.claude-work2` is only listed by a `claude` pointed there.
+    #[test]
+    fn the_probe_runs_on_the_sessions_account() {
+        let script = format!(
+            "[ \"$CLAUDE_CONFIG_DIR\" = /nebula-test/work2 ] || exit 1\ncat <<'EOF'\n{LISTING}EOF"
+        );
+        let args = vec!["-c".to_string(), script];
+        let work2 = [(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/nebula-test/work2".to_string(),
+        )];
+        assert_eq!(
+            probe("/bin/sh", &args, &work2, SID).as_deref(),
+            Some("1a3138b9")
+        );
+        let other = [(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/nebula-test/work".to_string(),
+        )];
+        assert_eq!(probe("/bin/sh", &args, &other, SID), None);
     }
 
     #[test]
@@ -265,7 +307,7 @@ mod tests {
         let started = Instant::now();
         let args = vec!["-c".to_string(), "sleep 30".to_string()];
         assert_eq!(
-            run_captured("/bin/sh", &args, Duration::from_millis(150)),
+            run_captured("/bin/sh", &args, &[], Duration::from_millis(150)),
             None
         );
         assert!(started.elapsed() < Duration::from_secs(5));

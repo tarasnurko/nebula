@@ -353,6 +353,7 @@ impl Store {
             conn: Mutex::new(conn),
         };
         store.migrate()?;
+        store.ensure_account_table()?;
         Ok(store)
     }
 
@@ -363,6 +364,7 @@ impl Store {
             conn: Mutex::new(conn),
         };
         store.migrate()?;
+        store.ensure_account_table()?;
         Ok(store)
     }
 
@@ -384,6 +386,46 @@ impl Store {
             .with_context(|| format!("migration {}", i + 1))?;
         }
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(())
+    }
+
+    /// The ACCOUNT each agent was started on, kept beside `agents` rather
+    /// than as a numbered migration: a fork's numbered step would collide
+    /// with the next upstream one, while `IF NOT EXISTS` runs the same on a
+    /// fresh file and an old one, and an older build simply never reads it.
+    /// The row goes with its agent.
+    fn ensure_account_table(&self) -> Result<()> {
+        self.conn.lock().execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_accounts (
+                agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+                dir TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// The ACCOUNT folder an agent was started on, as picked (`~/.claude-work2`);
+    /// `Some("")` for one started with no folder passed, None for a row
+    /// from before accounts were kept.
+    pub fn agent_account(&self, id: &AgentId) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT dir FROM agent_accounts WHERE agent_id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Keep the ACCOUNT folder an agent runs on ("" = no folder passed), so
+    /// every later spawn — a respawn after a restart included — finds its
+    /// chat where it began.
+    pub fn set_agent_account(&self, id: &AgentId, dir: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO agent_accounts (agent_id, dir) VALUES (?1, ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET dir = excluded.dir",
+            params![id.as_str(), dir],
+        )?;
         Ok(())
     }
 
@@ -1241,6 +1283,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_agents_account_survives_a_reopen_and_goes_with_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nebula.db");
+        let store = Store::open(&path).unwrap();
+        let project = Project {
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+        };
+        store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/demo".into(),
+            branch: "main".into(),
+            is_main: true,
+            sort_order: 0,
+        };
+        store.insert_worktree(&worktree).unwrap();
+        let agent = |name: &str| Agent {
+            id: AgentId::generate(),
+            worktree_id: worktree.id.clone(),
+            name: name.into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: false,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+            recent_prompts: Vec::new(),
+        };
+        let (work2, bare, legacy) = (agent("work2"), agent("bare"), agent("legacy"));
+        for a in [&work2, &bare, &legacy] {
+            store.insert_agent(a).unwrap();
+        }
+        store
+            .set_agent_account(&work2.id, "~/.claude-work")
+            .unwrap();
+        // A second pick overwrites; it never adds a row.
+        store
+            .set_agent_account(&work2.id, "~/.claude-work2")
+            .unwrap();
+        store.set_agent_account(&bare.id, "").unwrap();
+        drop(store);
+
+        // A daemon restart reopens the file: every pick is still there, and
+        // "no folder" stays apart from "never recorded".
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.agent_account(&work2.id).unwrap().as_deref(),
+            Some("~/.claude-work2")
+        );
+        assert_eq!(store.agent_account(&bare.id).unwrap().as_deref(), Some(""));
+        assert_eq!(store.agent_account(&legacy.id).unwrap(), None);
+
+        store.delete_agent(&work2.id).unwrap();
+        assert_eq!(store.agent_account(&work2.id).unwrap(), None);
+        let left: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM agent_accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1, "the deleted agent's row went with it");
+    }
+
+    #[test]
     fn roundtrip_tree() {
         let store = Store::open_in_memory().unwrap();
         let project = Project {
@@ -1781,6 +1899,7 @@ mod tests {
 
     fn table_names_without_workspaces() -> Vec<String> {
         [
+            "agent_accounts",
             "agents",
             "links",
             "pr_seen",

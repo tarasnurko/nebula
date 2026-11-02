@@ -214,6 +214,33 @@ pub(crate) fn cycle_owned(current: &str, choices: &[String], delta: i32) -> Stri
     choices[cycled_index(current, choices, delta)].clone()
 }
 
+/// What a Project tab ACCOUNT row reads while the project picks none: its
+/// sessions start on the harness's global account.
+pub const GLOBAL_ACCOUNT_CHOICE: &str = "global";
+
+/// The short name an account row shows for folder `dir`: its own name
+/// (`.claude-work2`), or — when another of `choices` shares that name —
+/// its parent's name before it (`something/.claude-work`), so two folders
+/// never read alike.
+pub fn account_label(choices: &[String], dir: &str) -> String {
+    let path = nebula_core::harness::expand_account_dir(dir).unwrap_or_else(|| PathBuf::from(dir));
+    let name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    let own = name(&path);
+    let clash = choices.iter().any(|other| {
+        let other =
+            nebula_core::harness::expand_account_dir(other).unwrap_or_else(|| PathBuf::from(other));
+        other != path && name(&other) == own
+    });
+    match (clash, path.parent().and_then(|p| p.file_name())) {
+        (true, Some(parent)) => format!("{}/{own}", parent.to_string_lossy()),
+        _ => own,
+    }
+}
+
 /// Where `current` lands in `choices` after `delta` steps, wrapping; a
 /// value off the list (matched ignoring case) counts as the first.
 /// Panics on an empty list.
@@ -453,6 +480,8 @@ pub enum HarnessField {
     Enabled,
     Model,
     Effort,
+    /// The global ACCOUNT folder, on a harness with an account switch.
+    Account,
 }
 
 impl HarnessField {
@@ -461,6 +490,7 @@ impl HarnessField {
             HarnessField::Enabled => "Enabled",
             HarnessField::Model => "Model",
             HarnessField::Effort => "Effort",
+            HarnessField::Account => "Account",
         }
     }
 }
@@ -857,7 +887,10 @@ pub fn tab_settings(tab: usize) -> &'static [SettingSpec] {
 /// registry, so a new CLI grows it without a code change.
 pub fn tab_len(tab: usize) -> usize {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
-        Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings.len(),
+        Some(TabBody::Values(settings)) => settings.len(),
+        Some(TabBody::Project(settings)) => {
+            settings.len() + Config::load().account_harnesses().len()
+        }
         Some(TabBody::Hotkeys) => crate::keymap::ACTIONS.len(),
         Some(TabBody::Agents) => AGENTS_HEAD.len() + Config::load().agent_rows().len(),
         None => 0,
@@ -906,6 +939,12 @@ pub fn all_settings() -> impl Iterator<Item = (usize, usize, &'static SettingSpe
 /// The Agents tab reads the registry for its harness rows.
 pub fn hint_at(tab: usize, index: usize) -> String {
     match SETTINGS_TABS.get(tab).map(|t| t.body) {
+        Some(TabBody::Project(settings)) if index >= settings.len() => {
+            let cfg = Config::load();
+            cfg.project_account_row(index)
+                .map(|id| cfg.project_account_hint(&id))
+                .unwrap_or_default()
+        }
         Some(TabBody::Values(settings) | TabBody::Project(settings)) => settings
             .get(index)
             .map(|s| s.hint)
@@ -959,6 +998,8 @@ pub fn settings_rows(tab: usize) -> Vec<SettingsRow> {
                 settings.iter().map(|s| s.group.to_string()),
                 SettingsRow::Setting,
             ));
+            let accounts = Config::load().account_harnesses().len();
+            rows.extend((settings.len()..settings.len() + accounts).map(SettingsRow::Setting));
             rows
         }
         Some(TabBody::Hotkeys) => grouped(
@@ -1072,6 +1113,16 @@ fn search_text(cfg: &Config, keymap: &crate::keymap::Keymap, tab: usize, index: 
             };
             format!("{label} {}", cfg.agent_hint_by_index(index))
         }
+        Some(TabBody::Project(settings)) if index >= settings.len() => cfg
+            .project_account_row(index)
+            .map(|id| {
+                format!(
+                    "{} {}",
+                    cfg.project_account_row_label(&id),
+                    cfg.project_account_hint(&id)
+                )
+            })
+            .unwrap_or_default(),
         _ => setting_at(tab, index)
             .map(|s| format!("{} {}", s.label, s.hint))
             .unwrap_or_default(),
@@ -1387,6 +1438,12 @@ pub struct Config {
     /// rules: a value in here this build can't read costs the whole map,
     /// not one project.
     pub projects: BTreeMap<PathBuf, ProjectSettings>,
+    /// ACCOUNT folders added by hand (**+ add folder…** in an account
+    /// picker), by harness id, for folders the pickers can't find on their
+    /// own — anywhere but beside the CLI's own folder. Listed in every
+    /// account picker for that harness after the ones found.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_folders: BTreeMap<String, Vec<String>>,
     /// Experimental: REMEMBER HARNESS — a launch walked through the NEW
     /// SESSION PICKER, the PR SESSION picker or the QUICK PROMPT's `Tab`
     /// picker writes its harness into `quick_prompt_kind`, and a model or
@@ -1546,6 +1603,13 @@ pub struct ProjectSettings {
     /// empty, like `run_command`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub open_command: String,
+    /// The ACCOUNT folder each harness's new sessions in this project start
+    /// on, by harness id (`{"claude": "~/.claude-work2"}`) — the Project
+    /// tab's account rows. A harness it doesn't name is on its global
+    /// account (Settings → Agents → Account). The DAEMON reads it at each
+    /// create; a session keeps the account it started on.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, String>,
     /// Keys in the entry this build doesn't know — a newer nebula's, most
     /// likely, or the retired `hide_root_worktree` an older one wrote —
     /// carried through a save untouched, as the file's top-level keys
@@ -1646,6 +1710,7 @@ impl Default for Config {
             recent_prompts: false,
             recent_prompts_count: 3,
             projects: BTreeMap::new(),
+            account_folders: BTreeMap::new(),
             show_key_combos: false,
             remember_harness: false,
             pr_issue_counts: true,
@@ -2150,6 +2215,9 @@ impl Config {
             if entry.effort.offered {
                 rows.push((entry.id.clone(), HarnessField::Effort));
             }
+            if entry.has_accounts() {
+                rows.push((entry.id.clone(), HarnessField::Account));
+            }
         }
         rows
     }
@@ -2179,6 +2247,10 @@ impl Config {
                     descriptor.effort.default.clone()
                 }
             }
+            HarnessField::Account => match descriptor.account.dir.as_deref().map(str::trim) {
+                Some(dir) if !dir.is_empty() => account_label(&self.account_choices(id), dir),
+                _ => DEFAULT_CHOICE.into(),
+            },
         }
     }
 
@@ -2219,6 +2291,9 @@ impl Config {
                     format!("Reserved until the {label} CLI documents a reasoning flag (default = unset)")
                 }
             }
+            HarnessField::Account => format!(
+                "Account folder new {label} sessions start on unless their project picks one; Enter lists folders (default = the CLI's own, or what its program sets)"
+            ),
         };
         if let Some(problem) = descriptor.problem() {
             hint.push_str(&format!(" — broken: {problem}"));
@@ -2280,7 +2355,162 @@ impl Config {
                 let next = cycle_owned(&descriptor.effort.default, &choices, step);
                 self.set_harness_effort(id, next);
             }
+            HarnessField::Account => {
+                let choices = self.account_cycle(id);
+                let current = descriptor.account.dir.clone().unwrap_or_default();
+                let next = cycle_owned(&current, &choices, step);
+                self.set_global_account(id, (!next.is_empty()).then_some(next));
+            }
         }
+    }
+
+    // ---- accounts ----
+
+    /// The harnesses the Project tab gives an ACCOUNT row, in registry
+    /// order: every one with an account switch.
+    pub fn account_harnesses(&self) -> Vec<String> {
+        self.harness_registry()
+            .into_iter()
+            .filter(|entry| entry.has_accounts())
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// The account folder the Project tab's row at tab-local `index`
+    /// stands for, as a harness id — None on a typed row above them.
+    pub fn project_account_row(&self, index: usize) -> Option<String> {
+        let first = tab_settings(project_tab()).len();
+        self.account_harnesses()
+            .into_iter()
+            .nth(index.checked_sub(first)?)
+    }
+
+    /// Every ACCOUNT folder the pickers offer for harness `id`, as shown
+    /// (`~/.claude-work`): the CLI's own folder and every sibling whose
+    /// name starts with its name, then the ones added by hand, then any
+    /// folder a project or the global row already picked that neither
+    /// holds. One entry per folder, however it was spelled.
+    pub fn account_choices(&self, id: &str) -> Vec<String> {
+        let descriptor = self.effective_harness_by_id(id);
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let mut push = |dir: &str| {
+            let Some(path) = nebula_core::harness::expand_account_dir(dir) else {
+                return;
+            };
+            if !seen.contains(&path) {
+                seen.push(path.clone());
+                out.push(nebula_core::harness::shown_account_dir(&path));
+            }
+        };
+        if let Some(home) = descriptor.account.home.as_deref() {
+            for dir in nebula_core::harness::discover_account_folders(home) {
+                push(&dir);
+            }
+        }
+        for dir in self.account_folders.get(id).into_iter().flatten() {
+            push(dir);
+        }
+        if let Some(dir) = descriptor.account.dir.as_deref() {
+            push(dir);
+        }
+        for settings in self.projects.values() {
+            if let Some(dir) = settings.accounts.get(id) {
+                push(dir);
+            }
+        }
+        out
+    }
+
+    /// What ←/→ step through on an account row: "" (global on the Project
+    /// tab, default on the Agents tab), then every folder.
+    fn account_cycle(&self, id: &str) -> Vec<String> {
+        std::iter::once(String::new())
+            .chain(self.account_choices(id))
+            .collect()
+    }
+
+    /// The label the Project tab's account row for harness `id` shows for
+    /// the project at `repo_path`: its folder's name, or `global`.
+    pub fn project_account_label(&self, repo_path: &Path, id: &str) -> String {
+        match self.project(repo_path).accounts.get(id).map(|d| d.trim()) {
+            Some(dir) if !dir.is_empty() => account_label(&self.account_choices(id), dir),
+            _ => GLOBAL_ACCOUNT_CHOICE.into(),
+        }
+    }
+
+    /// The Project tab account row's label: `Claude account`.
+    pub fn project_account_row_label(&self, id: &str) -> String {
+        format!(
+            "{} account",
+            self.effective_harness_by_id(id).display_label()
+        )
+    }
+
+    /// The Project tab account row's hint.
+    pub fn project_account_hint(&self, id: &str) -> String {
+        let label = self.effective_harness_by_id(id).display_label().to_string();
+        format!(
+            "Account folder new {label} sessions in this project start on; Enter lists folders, ←/→ steps (global = Settings → Agents → Account)"
+        )
+    }
+
+    /// Pick the ACCOUNT folder harness `id`'s new sessions in the project
+    /// at `repo_path` start on; None puts it back on the global account.
+    pub fn set_project_account(&mut self, repo_path: &Path, id: &str, dir: Option<String>) {
+        let mut settings = self.project(repo_path);
+        match dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+            Some(dir) => {
+                settings.accounts.insert(id.to_string(), dir);
+            }
+            None => {
+                settings.accounts.remove(id);
+            }
+        }
+        self.set_project(repo_path, settings);
+    }
+
+    /// Step the project at `repo_path`'s account row for harness `id`.
+    pub fn cycle_project_account(&mut self, repo_path: &Path, id: &str, delta: i32) {
+        let choices = self.account_cycle(id);
+        let current = self
+            .project(repo_path)
+            .accounts
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        let next = cycle_owned(&current, &choices, if delta == 0 { 1 } else { delta });
+        self.set_project_account(repo_path, id, Some(next));
+    }
+
+    /// Pick the global ACCOUNT folder of harness `id` (Settings → Agents →
+    /// Account); None is the default — no folder passed. An override left
+    /// saying nothing is dropped, so the file keeps no empty entry.
+    pub fn set_global_account(&mut self, id: &str, dir: Option<String>) {
+        let over = self.harness_override_mut(id);
+        over.account_dir = match dir.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+            Some(dir) => nebula_core::harness::Clearable::Set(dir),
+            None => nebula_core::harness::Clearable::Keep,
+        };
+        if *over == nebula_core::harness::HarnessOverride::default() {
+            self.harnesses.remove(id);
+        }
+    }
+
+    /// Keep a folder typed into **+ add folder…** in harness `id`'s
+    /// pickers, as shown (`~/x` under the home dir). Returns it so the
+    /// caller picks the same spelling; None for a blank one.
+    pub fn add_account_folder(&mut self, id: &str, dir: &str) -> Option<String> {
+        let path = nebula_core::harness::expand_account_dir(dir)?;
+        let shown = nebula_core::harness::shown_account_dir(&path);
+        let list = self.account_folders.entry(id.to_string()).or_default();
+        let known = list
+            .iter()
+            .any(|d| nebula_core::harness::expand_account_dir(d).as_ref() == Some(&path));
+        if !known {
+            list.push(shown.clone());
+        }
+        Some(shown)
     }
 
     /// Write an Enabled toggle: the `harnesses` map where it speaks, else
@@ -2992,7 +3222,6 @@ pub fn locate(kind: SettingKind) -> Option<(usize, usize)> {
     })
 }
 
-#[cfg(test)]
 /// Index of the Project tab, whose rows are the selected project's.
 pub fn project_tab() -> usize {
     SETTINGS_TABS
@@ -5026,6 +5255,63 @@ mod tests {
         assert!(cfg.enabled_kinds().is_empty());
     }
 
+    /// One folder is one picker row however it was spelled — `~/x` and
+    /// the absolute path alike — and a project's pick, a hand-added folder
+    /// and the global pick all join the list. A name two folders share
+    /// reads with its parent; a unique one alone.
+    #[test]
+    fn account_choices_list_each_folder_once_and_labels_never_read_alike() {
+        let home = nebula_core::env::home_dir().unwrap();
+        let mut cfg = Config::default();
+        cfg.harness_override_mut("claude").account_home =
+            nebula_core::harness::Clearable::Set("/nebula-test/none/.claude".into());
+        cfg.set_global_account("claude", Some("~/.nebula-test-acct".into()));
+        cfg.set_project_account(
+            Path::new("/tmp/demo"),
+            "claude",
+            Some(home.join(".nebula-test-acct").display().to_string()),
+        );
+        assert_eq!(
+            cfg.add_account_folder("claude", "/Volumes/ssd/.nebula-test-acct")
+                .as_deref(),
+            Some("/Volumes/ssd/.nebula-test-acct")
+        );
+        // Adding it again keeps one entry.
+        cfg.add_account_folder("claude", " /Volumes/ssd/.nebula-test-acct ");
+        assert_eq!(cfg.account_folders["claude"].len(), 1);
+        let choices = cfg.account_choices("claude");
+        assert_eq!(
+            choices,
+            ["/Volumes/ssd/.nebula-test-acct", "~/.nebula-test-acct"]
+        );
+        assert_eq!(
+            account_label(&choices, "~/.nebula-test-acct"),
+            format!(
+                "{}/.nebula-test-acct",
+                home.file_name().unwrap().to_string_lossy()
+            )
+        );
+        assert_eq!(
+            account_label(&choices, "/Volumes/ssd/.nebula-test-acct"),
+            "ssd/.nebula-test-acct"
+        );
+        assert_eq!(
+            account_label(&["~/.claude-work".into()], "~/.claude-work"),
+            ".claude-work"
+        );
+        assert_eq!(
+            cfg.project_account_label(Path::new("/tmp/other"), "claude"),
+            GLOBAL_ACCOUNT_CHOICE
+        );
+        // Back to default leaves no empty override behind, but keeps one
+        // that still says something.
+        cfg.set_global_account("claude", None);
+        assert!(cfg.harnesses["claude"].account_dir == nebula_core::harness::Clearable::Keep);
+        cfg.harness_override_mut("claude").account_home = nebula_core::harness::Clearable::Keep;
+        cfg.set_global_account("claude", None);
+        assert!(!cfg.harnesses.contains_key("claude"));
+    }
+
     #[test]
     fn grok_is_builtin_and_settings_persist_without_legacy_keys() {
         let mut cfg: Config = serde_json::from_str("{}").unwrap();
@@ -5546,7 +5832,8 @@ mod tests {
                         vec![
                             "Enabled".to_string(),
                             "Model".to_string(),
-                            "Effort".to_string()
+                            "Effort".to_string(),
+                            "Account".to_string()
                         ]
                     ),
                     (
@@ -5554,7 +5841,8 @@ mod tests {
                         vec![
                             "Enabled".to_string(),
                             "Model".to_string(),
-                            "Effort".to_string()
+                            "Effort".to_string(),
+                            "Account".to_string()
                         ]
                     ),
                     (

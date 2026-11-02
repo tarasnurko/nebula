@@ -197,6 +197,11 @@ fn handle_menu_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // owed its box back with the text still in it. Only a box that
             // was up comes back: `n`'s NEW SESSION PICKER is reached with
             // none and closes as any menu does (`QuickReturn::from_box`).
+            // An ACCOUNT PICKER stood in for the settings overlay: Esc puts
+            // the overlay back on the row it was opened from, unchanged.
+            KeyCode::Esc if menu.parent.is_none() && menu.is_account_picker() => {
+                reopen_settings(app);
+            }
             KeyCode::Esc => match menu.parent.take() {
                 Some(parent) => *menu = *parent,
                 None => match menu_quick_return(menu) {
@@ -257,7 +262,10 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>)
                 };
                 // A typed setting's prompt stood in for the overlay: Esc
                 // keeps the old value and puts the overlay back on its row.
-                let back_to_settings = matches!(prompt.kind, PromptKind::SettingText { .. });
+                let back_to_settings = matches!(
+                    prompt.kind,
+                    PromptKind::SettingText { .. } | PromptKind::AccountFolder { .. }
+                );
                 // The comment box stood in for the ISSUES MODAL: Esc puts
                 // the modal back on its row, the comment unposted.
                 let back_to_issues = match &prompt.kind {

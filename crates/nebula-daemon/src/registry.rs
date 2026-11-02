@@ -138,6 +138,10 @@ struct PrewarmEntry {
     /// model), so the entry is discarded instead.
     model: Option<String>,
     effort: Option<String>,
+    /// The ACCOUNT folder the warm CLI booted on ("" = none passed). A
+    /// create whose project now picks another can't adopt it: its CLI is
+    /// already signed in to the wrong account.
+    account: String,
     buffered_hooks: Vec<(HookEvent, Option<String>)>,
 }
 
@@ -189,6 +193,9 @@ pub struct Daemon {
     worktree_ops: tokio::sync::Mutex<()>,
     /// Warm agent CLIs awaiting adoption, at most one per (worktree, kind).
     prewarmed: Mutex<HashMap<(WorktreeId, AgentKind), PrewarmEntry>>,
+    /// The ACCOUNT folder each warm spare boots on, by its id — a spare has
+    /// no store row to keep it in until a create adopts it.
+    spare_accounts: Mutex<HashMap<AgentId, String>>,
     /// Cached `command -v` results per CLI so a missing binary doesn't get
     /// re-probed (login shell spawn) on every prewarm request.
     cli_probes: Mutex<HashMap<String, (bool, Instant)>>,
@@ -261,6 +268,7 @@ impl Daemon {
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
             prewarmed: Mutex::new(HashMap::new()),
+            spare_accounts: Mutex::new(HashMap::new()),
             cli_probes: Mutex::new(HashMap::new()),
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
@@ -294,6 +302,50 @@ fn claude_resumable_session(agent: &Agent) -> Option<&str> {
         return None;
     }
     agent.session_id.as_deref()
+}
+
+/// The ACCOUNT a row from before accounts were kept is kept on from its
+/// next start: a Claude row's is wherever its transcript is — the account
+/// whichever program started it pointed at, which a user switching
+/// wrappers may have changed since — searched in the global pick, then the
+/// CLI's own folder and its siblings; any other row's (or one whose
+/// transcript is in none of them) is the global pick.
+fn legacy_account(agent: &Agent, harness: &nebula_core::harness::HarnessDescriptor) -> String {
+    let global = harness.account_for(None).unwrap_or_default();
+    let Some(sid) = agent
+        .session_id
+        .as_deref()
+        .filter(|_| harness.account_env() == Some(nebula_core::env::CLAUDE_CONFIG_DIR))
+    else {
+        return global;
+    };
+    let found = harness
+        .account
+        .home
+        .as_deref()
+        .map(nebula_core::harness::discover_account_folders)
+        .unwrap_or_default();
+    std::iter::once(global.clone())
+        .filter(|dir| !dir.is_empty())
+        .chain(found)
+        .find(|dir| {
+            nebula_core::harness::expand_account_dir(dir).is_some_and(|path| {
+                claude_transcript_exists(&[path.join("projects")], sid) == Some(true)
+            })
+        })
+        .unwrap_or(global)
+}
+
+/// The env pair that points `harness`'s CLI at an ACCOUNT folder: its
+/// account var and `dir`, when it has a var and the session has a folder.
+fn account_env_pair(
+    harness: &nebula_core::harness::HarnessDescriptor,
+    dir: Option<&Path>,
+) -> Option<(String, String)> {
+    Some((
+        harness.account_env()?.to_string(),
+        dir?.to_string_lossy().into_owned(),
+    ))
 }
 
 /// Whether Claude Code still holds the transcript `claude --resume <id>`
@@ -2897,6 +2949,7 @@ mod tests {
                 spawned_at: Instant::now(),
                 model: None,
                 effort: None,
+                account: String::new(),
                 buffered_hooks: Vec::new(),
             },
         );
@@ -3083,6 +3136,461 @@ mod tests {
             terminals.is_empty(),
             "a refused create must not reappear on reconnect"
         );
+    }
+
+    // ---- accounts ----
+
+    /// A stand-in CLI that writes the account vars it was started with into
+    /// `account.txt` in its checkout, then idles like a booted CLI.
+    fn account_probe_cli(dir: &Path) -> PathBuf {
+        let script = dir.join("probe-cli.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s|%s' \"${CLAUDE_CONFIG_DIR-unset}\" \"${CODEX_HOME-unset}\" > account.txt\nexec cat\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn read_when_written(path: &Path) -> String {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("{} was never written", path.display());
+    }
+
+    /// The session's own ACCOUNT folder reaches its CLI as the harness's
+    /// account var, and a session kept with no folder gets the env it
+    /// would have had anyway — nebula sets nothing for it.
+    #[tokio::test]
+    async fn a_session_starts_on_the_account_it_was_kept_with() {
+        let scratch = tempfile::tempdir().unwrap();
+        let cli = account_probe_cli(scratch.path());
+        let _cmd = EnvGuard::set(env::AGENT_CMD, cli.to_str().unwrap());
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let (work2, bare) = (
+            scratch.path().join("w-work2"),
+            scratch.path().join("w-bare"),
+        );
+        for (id, path) in [("w1", &work2), ("w2", &bare)] {
+            std::fs::create_dir(path).unwrap();
+            seed_worktree(&daemon, "p", id, path.to_str().unwrap(), false);
+        }
+        seed_agent(&daemon, "a", "w1", None);
+        seed_agent(&daemon, "b", "w2", None);
+        daemon
+            .store
+            .set_agent_account(&AgentId("a".into()), "/nebula-test/.claude-work2")
+            .unwrap();
+        daemon
+            .store
+            .set_agent_account(&AgentId("b".into()), "")
+            .unwrap();
+
+        for id in ["a", "b"] {
+            daemon
+                .ensure_session(&SessionRef::Agent(AgentId(id.into())), 80, 24)
+                .unwrap();
+        }
+        // Codex's var is never set for a Claude session.
+        assert_eq!(
+            read_when_written(&work2.join("account.txt")),
+            "/nebula-test/.claude-work2|unset"
+        );
+        let inherited = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| "unset".into());
+        assert_eq!(
+            read_when_written(&bare.join("account.txt")),
+            format!("{inherited}|unset")
+        );
+        for id in ["a", "b"] {
+            daemon.kill_session(&SessionRef::Agent(AgentId(id.into())));
+        }
+    }
+
+    /// A Codex session on its own account gets `CODEX_HOME` pointed there,
+    /// and nebula's managed hooks land in that folder — the one this CLI
+    /// reads — rather than in the default `~/.codex`.
+    #[tokio::test]
+    async fn a_codex_session_gets_its_account_and_its_hooks_there() {
+        let scratch = tempfile::tempdir().unwrap();
+        let cli = account_probe_cli(scratch.path());
+        let _cmd = EnvGuard::set(env::AGENT_CMD, cli.to_str().unwrap());
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let checkout = scratch.path().join("w");
+        std::fs::create_dir(&checkout).unwrap();
+        seed_worktree(&daemon, "p", "w", checkout.to_str().unwrap(), false);
+        let home = scratch.path().join(".codex-work");
+        std::fs::create_dir(&home).unwrap();
+        let mut agent = daemon_agent("c", "w");
+        agent.kind = AgentKind::Codex;
+        daemon.store.insert_agent(&agent).unwrap();
+        daemon
+            .store
+            .set_agent_account(&agent.id, home.to_str().unwrap())
+            .unwrap();
+
+        daemon
+            .ensure_session(&SessionRef::Agent(agent.id.clone()), 80, 24)
+            .unwrap();
+        assert_eq!(
+            read_when_written(&checkout.join("account.txt")),
+            format!(
+                "{}|{}",
+                std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_else(|_| "unset".into()),
+                home.display()
+            )
+        );
+        assert!(
+            home.join("hooks.json").is_file(),
+            "hooks went to the account"
+        );
+        daemon.kill_session(&SessionRef::Agent(agent.id));
+    }
+
+    fn daemon_agent(id: &str, worktree: &str) -> Agent {
+        Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId(worktree.into()),
+            name: id.into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            unseen: false,
+            kind: AgentKind::Claude,
+            custom_harness: None,
+            model: None,
+            effort: None,
+            session_id: None,
+            cloud_session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: false,
+            issue_url: None,
+            role: nebula_core::AgentRole::Worker,
+            recent_prompts: Vec::new(),
+        }
+    }
+
+    /// A new session starts on its project's pick, else the harness's
+    /// global one; a project that picks nothing, or picks only for another
+    /// harness, is on the global one, and a CLI with no account switch
+    /// never gets a folder.
+    #[test]
+    fn a_new_session_starts_on_its_projects_account_else_the_global_one() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p", "q"]);
+        seed_worktree(&daemon, "p", "wp", "/tmp/p-feat", false);
+        seed_worktree(&daemon, "q", "wq", "/tmp/q", true);
+        let config: crate::config::Config = serde_json::from_str(
+            r#"{"projects": {
+                "/tmp/p": { "accounts": { "claude": "~/.claude-work2" } },
+                "/tmp/q": { "accounts": { "codex": "~/.codex-work" } }
+            }}"#,
+        )
+        .unwrap();
+        let all = test_registry();
+        let mut claude = test_harness(&all, AgentKind::Claude);
+        let worktree = |id: &str| {
+            daemon
+                .store
+                .get_worktree(&WorktreeId(id.into()))
+                .unwrap()
+                .unwrap()
+        };
+        let start = |worktree: &Worktree, harness: &nebula_core::harness::HarnessDescriptor| {
+            daemon
+                .launch_account_in(&config, worktree, harness)
+                .unwrap()
+        };
+
+        // Nothing global: only the project that picked has a folder.
+        assert_eq!(start(&worktree("wp"), &claude), "~/.claude-work2");
+        assert_eq!(start(&worktree("wq"), &claude), "");
+        claude.account.dir = Some("~/.claude-work".into());
+        // A worktree of `p` (not its root) still reads `p`'s pick.
+        assert_eq!(start(&worktree("wp"), &claude), "~/.claude-work2");
+        assert_eq!(start(&worktree("wq"), &claude), "~/.claude-work");
+        let codex = test_harness(&all, AgentKind::Codex);
+        assert_eq!(start(&worktree("wq"), &codex), "~/.codex-work");
+        assert_eq!(start(&worktree("wp"), &codex), "");
+        let mut cursor = test_harness(&all, AgentKind::Cursor);
+        cursor.account.dir = Some("~/.cursor-work".into());
+        assert_eq!(start(&worktree("wp"), &cursor), "");
+    }
+
+    /// The account a row was started on is its for good: changing the
+    /// global pick later never moves it. A row from before accounts were
+    /// kept takes the global pick of the moment it next starts — and keeps
+    /// it from then on.
+    #[test]
+    fn a_rows_account_never_follows_a_later_pick() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp/p", true);
+        seed_agent(&daemon, "kept", "w", None);
+        seed_agent(&daemon, "legacy", "w", None);
+        let kept = daemon
+            .store
+            .get_agent(&AgentId("kept".into()))
+            .unwrap()
+            .unwrap();
+        let legacy = daemon
+            .store
+            .get_agent(&AgentId("legacy".into()))
+            .unwrap()
+            .unwrap();
+        daemon
+            .store
+            .set_agent_account(&kept.id, "~/.claude-work2")
+            .unwrap();
+
+        let all = test_registry();
+        let mut claude = test_harness(&all, AgentKind::Claude);
+        claude.account.dir = Some("~/.claude-work".into());
+        assert_eq!(daemon.agent_account(&kept, &claude), "~/.claude-work2");
+        assert_eq!(daemon.agent_account(&legacy, &claude), "~/.claude-work");
+
+        claude.account.dir = Some("~/.claude-other".into());
+        assert_eq!(daemon.agent_account(&kept, &claude), "~/.claude-work2");
+        assert_eq!(
+            daemon.agent_account(&legacy, &claude),
+            "~/.claude-work",
+            "the legacy row kept the pick it first started on"
+        );
+        // A warm spare is not in the store; it reads what it booted on.
+        let spare = daemon_agent("spare", "w");
+        daemon
+            .spare_accounts
+            .lock()
+            .insert(spare.id.clone(), "~/.claude-spare".into());
+        assert_eq!(daemon.agent_account(&spare, &claude), "~/.claude-spare");
+    }
+
+    /// A Claude row from before accounts were kept resumes from wherever
+    /// its transcript is — the folder of whichever wrapper started it — not
+    /// from today's global pick, which would boot it fresh and drop its
+    /// conversation. A row with no conversation, or one found nowhere, is
+    /// kept on the global pick.
+    #[test]
+    fn a_legacy_claude_row_is_kept_on_the_account_holding_its_transcript() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        for name in [".claude", ".claude-work", ".claude-work2/projects/-tmp-p"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::fs::write(
+            root.join(".claude-work2/projects/-tmp-p/sid-3.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        let all = test_registry();
+        let mut claude = test_harness(&all, AgentKind::Claude);
+        claude.account.home = Some(root.join(".claude").display().to_string());
+        let global = root.join(".claude-work").display().to_string();
+        claude.account.dir = Some(global.clone());
+        let mut agent = daemon_agent("old", "w");
+        agent.session_id = Some("sid-3".into());
+        assert_eq!(
+            legacy_account(&agent, &claude),
+            root.join(".claude-work2").display().to_string()
+        );
+        agent.session_id = Some("sid-elsewhere".into());
+        assert_eq!(legacy_account(&agent, &claude), global);
+        agent.session_id = None;
+        assert_eq!(legacy_account(&agent, &claude), global);
+        // Codex rows are never searched: theirs is the global pick.
+        let mut codex = test_harness(&all, AgentKind::Codex);
+        codex.account.home = claude.account.home.clone();
+        agent.session_id = Some("sid-3".into());
+        assert_eq!(legacy_account(&agent, &codex), "");
+    }
+
+    /// After a daemon restart no hook has named the transcript of a session
+    /// started on another account, so its resume look must still search
+    /// that account: otherwise the session is booted fresh and its
+    /// conversation silently dropped.
+    #[test]
+    fn a_resume_looks_for_the_transcript_in_the_sessions_account() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w", "/tmp/p", true);
+        seed_agent(&daemon, "a", "w", Some("sid-7"));
+        let account = tempfile::tempdir().unwrap();
+        let slug = account.path().join("projects/-tmp-p");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(slug.join("sid-7.jsonl"), "{}\n").unwrap();
+        let agent = daemon
+            .store
+            .get_agent(&AgentId("a".into()))
+            .unwrap()
+            .unwrap();
+        daemon
+            .store
+            .set_agent_account(&agent.id, account.path().to_str().unwrap())
+            .unwrap();
+
+        let dirs = daemon.claude_projects_dirs_in(Some(account.path()));
+        assert_eq!(dirs[0], account.path().join("projects"));
+        assert_eq!(claude_transcript_exists(&dirs, "sid-7"), Some(true));
+        // Without the account the same look finds nothing to resume.
+        assert_ne!(
+            claude_transcript_exists(&daemon.claude_projects_dirs(), "sid-7"),
+            Some(true)
+        );
+    }
+
+    /// A warm spare is only adopted by a create that would start on the
+    /// same account; one booted before the project's pick changed is
+    /// killed instead, and the pool forgets what it booted on either way.
+    #[tokio::test]
+    async fn a_spare_on_another_account_is_never_adopted() {
+        let _cmd = EnvGuard::set(env::AGENT_CMD, "/bin/cat");
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let checkout = tempfile::tempdir().unwrap();
+        seed_worktree(&daemon, "p", "w", checkout.path().to_str().unwrap(), true);
+        let worktree = daemon
+            .store
+            .get_worktree(&WorktreeId("w".into()))
+            .unwrap()
+            .unwrap();
+        let key = (WorktreeId("w".into()), AgentKind::Claude);
+        let warm = |id: &str, account: &str| {
+            let agent = daemon_agent(id, "w");
+            daemon
+                .spare_accounts
+                .lock()
+                .insert(agent.id.clone(), account.into());
+            daemon
+                .spawn_agent_session(&agent, &worktree, 80, 24)
+                .unwrap();
+            daemon.prewarmed.lock().insert(
+                key.clone(),
+                PrewarmEntry {
+                    agent_id: agent.id.clone(),
+                    spawned_at: Instant::now(),
+                    model: None,
+                    effort: None,
+                    account: account.into(),
+                    buffered_hooks: Vec::new(),
+                },
+            );
+            agent.id
+        };
+
+        let old = warm("warm-old", "~/.claude-work");
+        assert!(daemon
+            .take_prewarmed(&key.0, AgentKind::Claude, None, None, "~/.claude-work2")
+            .is_none());
+        assert!(!daemon.is_alive(&SessionRef::Agent(old.clone())));
+        assert!(!daemon.spare_accounts.lock().contains_key(&old));
+
+        let new = warm("warm-new", "~/.claude-work2");
+        let taken = daemon
+            .take_prewarmed(&key.0, AgentKind::Claude, None, None, "~/.claude-work2")
+            .expect("a spare on the same account is adopted");
+        assert_eq!(taken.agent_id, new);
+        assert!(!daemon.spare_accounts.lock().contains_key(&new));
+        daemon.kill_session(&SessionRef::Agent(new));
+    }
+
+    /// One more var set under the lock an [`EnvGuard`] holds — two guards
+    /// in one test would wait on each other — restored on drop.
+    struct ExtraEnv {
+        key: &'static str,
+        was: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn also(&self, key: &'static str, value: &str) -> ExtraEnv {
+            let was = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            ExtraEnv { key, was }
+        }
+    }
+
+    impl Drop for ExtraEnv {
+        fn drop(&mut self) {
+            match self.was.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// The whole path a user takes: pick an account for one project in
+    /// Settings, start a session there, then pick another. The session
+    /// starts on the first pick and, restarted after the change, stays on
+    /// it — its chat lives there.
+    #[tokio::test]
+    async fn a_session_created_in_a_project_keeps_that_projects_account() {
+        let scratch = tempfile::tempdir().unwrap();
+        let cli = account_probe_cli(scratch.path());
+        let cmd = EnvGuard::set(env::AGENT_CMD, cli.to_str().unwrap());
+        let data = scratch.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let _data = cmd.also(env::DATA_DIR, data.to_str().unwrap());
+        let _file = cmd.also(env::CONFIG_FILE, "");
+        let write_config = |dir: &str| {
+            std::fs::write(
+                data.join("config.json"),
+                format!(
+                    r#"{{"prewarm_agents": false, "projects": {{"/tmp/p": {{"accounts": {{"claude": "{dir}"}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write_config("/nebula-test/.claude-work2");
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        let checkout = scratch.path().join("p-feat");
+        std::fs::create_dir(&checkout).unwrap();
+        seed_worktree(&daemon, "p", "w", checkout.to_str().unwrap(), false);
+
+        let EntityId::Agent(id) = daemon
+            .create_agent(CreateAgentSpec {
+                worktree: WorktreeId("w".into()),
+                name: "s".into(),
+                kind: AgentKind::Claude,
+                custom_harness: None,
+                model: None,
+                effort: None,
+                auto_title: false,
+                cloud_prompt: None,
+                starting_prompt: None,
+                pr_url: None,
+                issue_url: None,
+                role: nebula_core::AgentRole::Worker,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("an agent was created");
+        };
+        let probe = checkout.join("account.txt");
+        assert!(read_when_written(&probe).starts_with("/nebula-test/.claude-work2|"));
+        assert_eq!(
+            daemon.store.agent_account(&id).unwrap().as_deref(),
+            Some("/nebula-test/.claude-work2")
+        );
+
+        write_config("/nebula-test/.claude-work3");
+        daemon.kill_session(&SessionRef::Agent(id.clone()));
+        std::fs::remove_file(&probe).unwrap();
+        daemon
+            .ensure_session(&SessionRef::Agent(id.clone()), 80, 24)
+            .unwrap();
+        assert!(read_when_written(&probe).starts_with("/nebula-test/.claude-work2|"));
+        daemon.kill_session(&SessionRef::Agent(id));
     }
 
     fn seed_projects(daemon: &Daemon, names: &[&str]) {
@@ -4641,6 +5149,7 @@ mod tests {
                 spawned_at: Instant::now(),
                 model: None,
                 effort: None,
+                account: String::new(),
                 buffered_hooks: Vec::new(),
             },
         );
@@ -4690,7 +5199,7 @@ mod tests {
         // No live PTY backs the entry, so take() refuses it (create falls
         // back to a cold spawn) and reap clears it out.
         assert!(daemon
-            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude, None, None)
+            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude, None, None, "")
             .is_none());
         assert!(daemon.prewarmed.lock().is_empty());
 
@@ -4701,6 +5210,7 @@ mod tests {
                 spawned_at: Instant::now(),
                 model: None,
                 effort: None,
+                account: String::new(),
                 buffered_hooks: Vec::new(),
             },
         );
@@ -4926,6 +5436,7 @@ mod tests {
                 spawned_at: Instant::now(),
                 model: None,
                 effort: None,
+                account: String::new(),
                 buffered_hooks: Vec::new(),
             },
         );
@@ -4959,6 +5470,7 @@ mod tests {
                     spawned_at: Instant::now(),
                     model: None,
                     effort: None,
+                    account: String::new(),
                     buffered_hooks: Vec::new(),
                 },
             );

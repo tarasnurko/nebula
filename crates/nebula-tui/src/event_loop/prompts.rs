@@ -186,6 +186,28 @@ pub(crate) fn open_prompt(app: &mut App, kind: PromptKind) {
             };
             (title.into(), hint.into(), value)
         }
+        PromptKind::AccountFolder { harness, project } => {
+            let cfg = crate::config::Config::load();
+            let label = cfg
+                .effective_harness_by_id(harness)
+                .display_label()
+                .to_string();
+            let title = match project.as_deref().and_then(|path| {
+                app.tree
+                    .projects
+                    .iter()
+                    .find(|p| p.repo_path == path)
+                    .map(|p| p.name.clone())
+            }) {
+                Some(name) => format!("{label} account folder · {name}"),
+                None => format!("{label} account folder · every project"),
+            };
+            (
+                title.into(),
+                "folder path, e.g. /Volumes/ssd/.claude or ~/work/.claude (empty = back)".into(),
+                String::new(),
+            )
+        }
 
         PromptKind::IssueComment { issue, .. } => {
             let title = if issue.title.trim().is_empty() {

@@ -18183,6 +18183,233 @@ pub(super) fn worktree_branches(app: &App) -> Vec<String> {
         .collect()
 }
 
+/// The PROJECT TAB's ACCOUNT rows: one per harness with an account switch,
+/// under the typed rows, reading `global` until the project picks. Enter
+/// lists every folder by its full path — the CLI's own and its siblings,
+/// never a file beside them — and a pick lands in the selected project's
+/// entry only, the row reading the folder's name back; Esc on the list
+/// keeps the old pick and puts the overlay back on the row; ←/→ step
+/// through the same list; **+ add folder…** types one in, which joins the
+/// list for good and is picked, and a name two folders share reads with
+/// its parent.
+#[test]
+fn the_project_tab_picks_an_account_folder_from_a_list() {
+    use nebula_core::{Entity, Project, ProjectId};
+    let draw_to_string = |app: &mut App| {
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        buffer_text(&terminal)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    for name in [".claude", ".claude-work", ".claude-work2"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    std::fs::write(root.join(".claude.json"), "{}").unwrap();
+    let shown = |name: &str| root.join(name).display().to_string();
+    let path = root.join("config.json");
+    // The pickers look beside these folders instead of the real home.
+    std::fs::write(
+        &path,
+        serde_json::json!({ "harnesses": {
+            "claude": { "account_home": shown(".claude") },
+            "codex": { "account_home": shown(".codex") },
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let saved = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    crate::config::with_config_path(path.clone(), || {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    id: ProjectId("p2".into()),
+                    name: "other".into(),
+                    repo_path: "/tmp/other".into(),
+                    sort_order: 1,
+                }),
+            },
+        );
+        app.nav.sel_project = 0;
+        let tab = crate::config::project_tab();
+        let row = crate::config::tab_settings(tab).len();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
+        press(&mut app, KeyCode::Char(digit), KeyModifiers::NONE, &mut out);
+        for _ in 0..crate::config::tab_len(tab) {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        for _ in 0..=row {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(settings_view(&app).selected, row);
+        let screen = draw_to_string(&mut app);
+        assert!(screen.contains("Claude account"), "{screen}");
+        assert!(screen.contains("Codex account"), "{screen}");
+        assert!(screen.contains("[global]"), "{screen}");
+
+        // Enter: the folders by full path, the file beside them left out.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let labels = |app: &App| -> Vec<String> {
+            let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+                panic!("expected the account picker, got {:?}", app.modals.overlay);
+            };
+            menu.items.iter().map(|i| i.label.clone()).collect()
+        };
+        assert_eq!(
+            labels(&app),
+            [
+                "global (Settings → Agents)  ✓".to_string(),
+                shown(".claude"),
+                shown(".claude-work"),
+                shown(".claude-work2"),
+                "+ add folder…".to_string(),
+            ]
+        );
+        // Esc: nothing picked, the overlay back on the row.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert_eq!(settings_view(&app).selected, row);
+        assert!(saved(&path).get("projects").is_none());
+
+        // Pick `.claude-work2`: the selected project's entry, and only it.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "a pick is a file write, not a request");
+        assert_eq!(
+            saved(&path)["projects"],
+            serde_json::json!({ "/tmp/demo": { "accounts": { "claude": shown(".claude-work2") } } })
+        );
+        assert_eq!(settings_view(&app).selected, row);
+        let screen = draw_to_string(&mut app);
+        assert!(screen.contains("[.claude-work2]"), "{screen}");
+
+        // ←: one step back through the same list.
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            saved(&path)["projects"]["/tmp/demo"]["accounts"]["claude"],
+            serde_json::json!(shown(".claude-work"))
+        );
+
+        // The list opens on the current pick, ticked.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+            panic!("expected the account picker");
+        };
+        assert_eq!(
+            menu.items[menu.hover].label,
+            format!("{}  ✓", shown(".claude-work"))
+        );
+        // + add folder…: one somewhere else, sharing a name with a found one.
+        let last = menu.items.len() - 1;
+        for _ in menu.hover..last {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Prompt(prompt)) = &app.modals.overlay else {
+            panic!("expected the folder prompt, got {:?}", app.modals.overlay);
+        };
+        assert_eq!(prompt.title, "Claude account folder · demo");
+        let elsewhere = shown("elsewhere/.claude-work");
+        type_text(&mut app, &elsewhere, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let file = saved(&path);
+        assert_eq!(
+            file["account_folders"],
+            serde_json::json!({ "claude": [elsewhere] })
+        );
+        assert_eq!(
+            file["projects"]["/tmp/demo"]["accounts"]["claude"],
+            serde_json::json!(elsewhere)
+        );
+        assert_eq!(settings_view(&app).selected, row);
+        let screen = draw_to_string(&mut app);
+        assert!(screen.contains("[elsewhere/.claude-work]"), "{screen}");
+
+        // Back to global drops the pick, and with it the project's entry.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(saved(&path)["projects"], serde_json::json!({}));
+    });
+}
+
+/// The Agents tab's **Account** row is the global pick: Enter lists the
+/// same folders with `default` first, a pick lands in the harness's own
+/// `harnesses` entry, and `default` takes it out again.
+#[test]
+fn the_agents_tab_account_row_picks_the_global_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    for name in [".claude", ".claude-work"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    let shown = |name: &str| root.join(name).display().to_string();
+    let path = root.join("config.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({ "harnesses": { "claude": { "account_home": shown(".claude") } } })
+            .to_string(),
+    )
+    .unwrap();
+    let saved = |path: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    crate::config::with_config_path(path.clone(), || {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        seed_tree(&mut app);
+        let (tab, row) =
+            crate::config::locate_agent("claude", crate::config::HarnessField::Account).unwrap();
+        press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
+        let digit = char::from_digit(tab as u32 + 1, 10).unwrap();
+        press(&mut app, KeyCode::Char(digit), KeyModifiers::NONE, &mut out);
+        for _ in 0..crate::config::tab_len(tab) {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        for _ in 0..=row {
+            press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(settings_view(&app).selected, row);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.modals.overlay else {
+            panic!("expected the account picker, got {:?}", app.modals.overlay);
+        };
+        assert_eq!(
+            menu.title.as_deref(),
+            Some("Claude account · every project")
+        );
+        assert_eq!(menu.items[0].label, "default (the CLI's own)  ✓");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            saved(&path)["harnesses"]["claude"],
+            serde_json::json!({ "account_home": shown(".claude"), "account_dir": shown(".claude-work") })
+        );
+        // default: the key goes, the rest of the entry stays.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            saved(&path)["harnesses"]["claude"],
+            serde_json::json!({ "account_home": shown(".claude") })
+        );
+    });
+}
+
 /// **Run command** on the PROJECT TAB: Enter opens a prompt titled with
 /// the project, pre-filled with its stored command; Enter there writes
 /// `run_command` into that project's entry (and nothing else), the

@@ -265,6 +265,21 @@ pub enum MenuAction {
     UnarchiveAgent(AgentId),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
+    /// ACCOUNT PICKER row: make `dir` harness `harness`'s ACCOUNT folder —
+    /// for the project at `project` (Settings → Project), or the global
+    /// one (Settings → Agents) when that is None. `dir` None puts the row
+    /// back on global (a project's) or default (the global one).
+    PickAccount {
+        harness: String,
+        project: Option<std::path::PathBuf>,
+        dir: Option<String>,
+    },
+    /// The ACCOUNT PICKER's last row, **+ add folder…**: type a folder it
+    /// doesn't list.
+    AddAccountFolder {
+        harness: String,
+        project: Option<std::path::PathBuf>,
+    },
     /// Picker result: create an agent of this kind (chains into the NEW
     /// SESSION box — a PR SESSION into its name prompt). `model`/`effort`
     /// are submenu choices: None means the row
@@ -478,6 +493,14 @@ pub struct MenuFilter {
 }
 
 impl ContextMenu {
+    /// Whether this is an ACCOUNT PICKER (Enter on a settings account row),
+    /// which stands in for the settings overlay until a row or Esc.
+    pub fn is_account_picker(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item.action, MenuAction::PickAccount { .. }))
+    }
+
     /// Narrow the rows to `query` (fuzzy, best match first; the full list
     /// in its own order when empty, hovering the ✓ row). Returns false —
     /// and changes nothing — when no row matches, so the list never
@@ -849,6 +872,15 @@ pub enum PromptKind {
     /// for a top-level row.
     SettingText {
         kind: crate::config::SettingKind,
+        project: Option<std::path::PathBuf>,
+    },
+    /// **+ add folder…** in an ACCOUNT PICKER: a folder to add to harness
+    /// `harness`'s pickers and pick at once — for the project at `project`,
+    /// or the global row when None. Like a typed setting's prompt it stands
+    /// in for the overlay: Enter and Esc both put it back, and an empty
+    /// answer adds nothing.
+    AccountFolder {
+        harness: String,
         project: Option<std::path::PathBuf>,
     },
     /// Rewrite a pinned link's URL.

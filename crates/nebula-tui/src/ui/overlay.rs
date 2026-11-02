@@ -916,6 +916,7 @@ fn append_settings_row(
             tab,
             inner,
             project_settings,
+            project.map(|(_, path)| path.as_path()),
             label_w,
             new_prefix,
             th,
@@ -933,6 +934,7 @@ fn append_setting_value_row(
     tab: usize,
     inner: Rect,
     project_settings: Option<&crate::config::ProjectSettings>,
+    project_path: Option<&std::path::Path>,
     label_w: usize,
     new_prefix: &impl Fn(crate::config::SettingKind) -> &'static str,
     th: Theme,
@@ -951,6 +953,16 @@ fn append_setting_value_row(
                 (field.label().to_string(), cfg.agent_value(&id, field), "")
             }
         }
+    } else if let Some(id) = (tab == crate::config::project_tab())
+        .then(|| cfg.project_account_row(i))
+        .flatten()
+    {
+        // An ACCOUNT row below the Project tab's typed rows: one per
+        // harness with an account switch, valued for the selected project.
+        let value = project_path
+            .map(|path| cfg.project_account_label(path, &id))
+            .unwrap_or_else(|| "n/a".into());
+        (cfg.project_account_row_label(&id), value, "")
     } else {
         let spec =
             crate::config::setting_at(tab, i).expect("settings_rows indexes this tab's settings");
